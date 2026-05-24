@@ -161,11 +161,25 @@ index.js                 # Spawner — auto-restarts ddos.js on crash
 
 ## Reset
 
-To kill all processes and clear saved state:
+To kill all running processes and clear saved state in one go:
 
 ```bash
 bash reset.sh
 ```
+
+Example output:
+
+```
+==> Killing spawner (index.js)...
+    No index.js process found.
+==> Killing attack process (ddos.js)...
+    No ddos.js process found.
+==> Removing saved state...
+    No state file to remove.
+==> Reset complete.
+```
+
+The script first terminates `index.js` (the spawner), then `ddos.js` (the attack process), and finally removes `attackState.json` to ensure no state is rewritten after cleanup.
 
 ---
 
