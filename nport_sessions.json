@@ -1,0 +1,8 @@
+{
+  "ddos": {
+    "subdomain": "ddos",
+    "tunnelId": "4d15ab04-02a0-478e-9d1e-a5fdc1031147",
+    "tunnelToken": "eyJhIjoiNDBmNDBhZDc2NDQ0NjhkMmY3ODZhNjY3NDMxOWRjNTAiLCJ0IjoiNGQxNWFiMDQtMDJhMC00NzhlLTlkMWUtYTVmZGMxMDMxMTQ3IiwicyI6ImdaM2xFTkhzL2dJTFA5aDlXaGZCUzk4T2dRRWw1UEtIQTAvdXhZazhTd0tJclFYY0ozaDU1YUhTRFJGZWlNUnZGQW5GaXlXYTBZZFJPZjNPc0ErR3d3PT0ifQ==",
+    "url": "https://ddos.nport.link"
+  }
+}

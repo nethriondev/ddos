@@ -10,7 +10,7 @@ cd ddos
 npm install
 ```
 
-Create `proxy.txt` and `ua.txt` files in the project directory.
+Create `proxy.txt` file in the project directory.
 
 ## Usage
 
@@ -46,7 +46,6 @@ GET /status
 ## Requirements
 - Node.js
 - Proxy list in proxy.txt
-- User agents in ua.txt
 
 ## License
 MIT
