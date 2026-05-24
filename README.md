@@ -57,7 +57,7 @@ Then type `help` at the `neth-orion>` prompt to see available commands, or hit t
 ## Features
 
 - **Multi-threaded Attacks** — Configurable thread count (default: 1,000) for concurrent request flooding
-- **Cluster Mode** — Automatic worker forking across all CPU cores; disable via `USE_CLUSTER=false`
+- **Cluster Mode** — Optional multi-core worker forking; enable via `USE_CLUSTER=true`
 - **Keep-Alive Connections** — Persistent HTTP/HTTPS sockets for higher throughput; disable via `KEEP_ALIVE=false`
 - **UDP Flood Mode** — Layer 4 UDP packet saturation against target IPs; disable via `UDP_FLOOD=false`
 - **Raw TCP Flood Mode** — Layer 4 TCP connection bursts with HTTP GET requests; disable via `RAW_TCP=false`
@@ -195,7 +195,7 @@ Both HTTP and SOCKS5 proxies are supported. Without proxies, the tool falls back
 | `UDP_FLOOD` | `true` | Enable UDP flood mode; set to `false` to disable |
 | `RAW_TCP` | `true` | Enable raw TCP flood mode; set to `false` to disable |
 | `KEEP_ALIVE` | `true` | Enable HTTP keep-alive connections; set to `false` to disable |
-| `USE_CLUSTER` | `true` | Enable multi-core cluster forking; set to `false` to disable |
+| `USE_CLUSTER` | `false` | Enable multi-core cluster forking; set to `true` to enable |
 | `PID` | — | Set to `0` to disable auto-restart from `index.js` |
 
 You can set these via command line or a `.env` file:
