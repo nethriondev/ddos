@@ -10,6 +10,7 @@ A multi-threaded HTTP stress testing tool with a CLI interface, REST API, proxy 
 
 - **Multi-threaded Attacks** — Configurable thread count (default: 1,000) for concurrent request flooding
 - **Proxy Rotation** — Loads proxies from `proxy.txt` and supports both HTTP and SOCKS5 proxies
+- **Proxy Management** — Built-in scripts to generate fresh proxies (`proxy_gen.js`) and remove dead ones (`proxy_cleaner.js`)
 - **Target Queue** — Add up to `MAX_QUEUE` targets; attacks run sequentially through the queue
 - **Cache Busting** — Random URL parameters and headers to bypass caching layers
 - **Custom Cipher Suites** — Configurable TLS cipher selection for varied request fingerprints
@@ -36,6 +37,71 @@ npm install
 
 ---
 
+## Proxy Management
+
+The project includes two standalone scripts for keeping your proxy list fresh and functional.
+
+### Proxy Generator
+
+Collects fresh proxies from public free proxy lists, tests each one, and saves only the alive ones to `proxy.txt`:
+
+```bash
+node proxy_gen.js
+```
+
+Fetches from 5 GitHub raw sources, deduplicates, and tests each proxy against a verification URL with a configurable timeout (default: 8s, concurrency: 50). Output:
+
+```
+  ╔══════════════════════════════╗
+  ║   NETH ORION Proxy Generator ║
+  ╚══════════════════════════════╝
+
+==> Collecting proxies from free sources...
+
+  Fetching http.txt... 764 proxies
+  Fetching http.txt... 412 proxies
+  ...
+
+==> Testing 1200 proxies (concurrency: 50, timeout: 8000ms)...
+
+  [12.4s] Tested: 1200/1200 | Alive: 89 | Dead: 1111 | Rate: 7.4%
+
+  ==> Saved 89 alive proxies to proxy.txt
+  Success rate: 7.4%
+```
+
+### Proxy Cleaner
+
+Examines every proxy already in `proxy.txt`, removes the dead ones, and keeps only the working ones. Creates a backup (`proxy.txt.bak`) before overwriting:
+
+```bash
+node proxy_cleaner.js
+```
+
+Output:
+
+```
+  ╔═══════════════════════════════╗
+  ║   NETH ORION Proxy Cleaner    ║
+  ╚═══════════════════════════════╝
+
+  Loaded 300 proxies from proxy.txt
+
+  [8.2s] Tested: 300/300 | Alive: 12 | Dead: 288
+
+  ═══════ RESULTS ═══════
+  Alive:  12
+  Dead:   288
+  Alive rate: 4.0%
+
+  Backup saved: proxy.txt.bak
+  ==> 288 dead proxies removed, 12 alive kept in proxy.txt
+```
+
+> **Tip:** Both scripts respect the `TEST_URL` environment variable (default: `https://httpbin.org/ip`) to change the verification endpoint.
+
+---
+
 ## Configuration
 
 ### 1. Proxy List
@@ -47,7 +113,7 @@ ip:port
 socks5://ip:port
 ```
 
-Both HTTP and SOCKS5 proxies are supported. Without proxies, attacks will not start.
+Both HTTP and SOCKS5 proxies are supported. Without proxies, the tool falls back to direct connections.
 
 ### 2. Environment Variables
 
@@ -145,6 +211,9 @@ index.js                 # Spawner — auto-restarts ddos.js on crash
         ├── Queue System  # Sequential target processing
         ├── State Manager # Persists/restores attack state to disk
         └── nport.js      # cloudflared tunnel for public access
+
+proxy_gen.js             # Scrapes free proxy lists → saves alive proxies to proxy.txt
+proxy_cleaner.js         # Tests proxies in proxy.txt → removes dead ones
 ```
 
 ### How It Works

