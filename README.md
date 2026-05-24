@@ -57,10 +57,12 @@ Then type `help` at the `neth-orion>` prompt to see available commands, or hit t
 ## Features
 
 - **Multi-threaded Attacks** — Configurable thread count (default: 1,000) for concurrent request flooding
+- **All Layers Concurrent** — L4 UDP flood, L4 Raw TCP flood, and L7 HTTP flood all run simultaneously on every thread for maximum impact
 - **Cluster Mode** — Optional multi-core worker forking; enable via `USE_CLUSTER=true`
 - **Keep-Alive Connections** — Persistent HTTP/HTTPS sockets for higher throughput; disable via `KEEP_ALIVE=false`
 - **UDP Flood Mode** — Layer 4 UDP packet saturation against target IPs; disable via `UDP_FLOOD=false`
 - **Raw TCP Flood Mode** — Layer 4 TCP connection bursts with HTTP GET requests; disable via `RAW_TCP=false`
+- **L7 Bypass Engine** (enabled by default) — Browser TLS fingerprint mimicry (custom cipher suites, curves, TLS versions matching Chrome 131 / Firefox 135), full Sec-* header family (Sec-CH-UA, Sec-Fetch-*, etc.), cookie/session persistence for `cf_clearance` tracking, and request timing jitter (50–200ms random delays between cycles)
 - **Proxy Rotation** — Supports both HTTP and SOCKS5 proxies from `proxy.txt`
 - **Proxy Management** — `proxy_gen.js` collects fresh proxies; `proxy_cleaner.js` removes dead ones
 - **Target Queue** — Up to `MAX_QUEUE` targets queued and run sequentially
@@ -197,7 +199,7 @@ Both HTTP and SOCKS5 proxies are supported. Without proxies, the tool falls back
 | `RAW_TCP` | `true` | Enable raw TCP flood mode; set to `false` to disable |
 | `KEEP_ALIVE` | `true` | Enable HTTP keep-alive connections; set to `false` to disable |
 | `USE_CLUSTER` | `false` | Enable multi-core cluster forking; set to `true` to enable |
-| `L7_BYPASS` | `false` | Enable L7 bypass techniques (browser TLS fingerprints, Sec-* headers, cookie persistence, request jitter); set to `true` to enable |
+| `L7_BYPASS` | `true` | Enable L7 bypass techniques (browser TLS fingerprints, Sec-* headers, cookie persistence, request jitter); set to `false` to disable |
 | `PID` | — | Set to `0` to disable auto-restart from `index.js` |
 
 You can set these via command line or a `.env` file:
@@ -343,15 +345,16 @@ proxy_cleaner.js         # Loads proxy.txt → tests each one → removes dead p
 2. `ddos.js` loads saved state from `attackState.json` and resumes any pending attack
 3. If `USE_CLUSTER` is enabled, `ddos.js` forks workers across all CPU cores via the `cluster` module
 4. If a tunnel is configured (`NPORT` env var), `nport.js` requests a token from `api.nport.link` and spawns cloudflared
-5. On `start`, threads are launched — each thread runs in a loop sending `PER_THREAD` requests per cycle:
-   - **HTTP mode**: Uses keep-alive agents (`http.Agent`/`https.Agent` with `keepAlive: true`, `maxSockets: Infinity`) for direct connections, or undici `ProxyAgent`/`socks-proxy-agent` for proxy routing
-   - **UDP mode**: Creates a `dgram` socket and sends 65,507-byte payloads to the target IP:port
-   - **Raw TCP mode**: Opens `net.Socket` connections, writes an HTTP GET request, then immediately destroys the socket
+5. On `start`, threads are launched — **each thread runs ALL attack layers simultaneously**:
+   - **UDP flood** (`dgram` socket sending 1,400-byte payloads to target IP:port — runs continuously in the background)
+   - **Raw TCP flood** (`net.Socket` connections writing HTTP GET requests then immediately destroying — runs continuously in the background)
+   - **HTTP flood** (main loop sending `PER_THREAD` requests per cycle with keep-alive agents, L7 bypass headers, cookie persistence, and request jitter)
 6. If proxies exist, threads split 50/50 between direct and proxy connections; each proxy thread picks a random entry from `proxy.txt`
 7. Every HTTP request includes cache-busting parameters (`_`, `nocache`, `cb`, `r`) and randomized headers (`User-Agent`, `X-Forwarded-For`, `CF-Connecting-IP`, `True-Client-IP`)
-8. Attack state is debounce-saved to disk every 500ms and sync-saved on target completion/stop
-9. When a target expires, the next target from the queue begins; if the queue is empty, the attack stops
-10. `index.js` restarts `ddos.js` on any exit (unless `PID=0`)
+8. The L7 Bypass engine (enabled by default) adds browser TLS fingerprinting, Sec-* headers, cookie/session persistence for `cf_clearance`, and 50–200ms request jitter
+9. Attack state is debounce-saved to disk every 500ms and sync-saved on target completion/stop
+10. When a target expires, the next target from the queue begins; if the queue is empty, the attack stops
+11. `index.js` restarts `ddos.js` on any exit (unless `PID=0`)
 
 ---
 

