@@ -65,6 +65,7 @@ Then type `help` at the `neth-orion>` prompt to see available commands, or hit t
 - **Proxy Management** — `proxy_gen.js` collects fresh proxies; `proxy_cleaner.js` removes dead ones
 - **Target Queue** — Up to `MAX_QUEUE` targets queued and run sequentially
 - **Cache Busting** — Random URL parameters and randomized headers
+- **L7 Bypass Mode** (`L7_BYPASS=true`) — Browser TLS fingerprint mimicry (custom cipher suites, curves, TLS versions matching Chrome 131 / Firefox 135), full Sec-* header family (Sec-CH-UA, Sec-Fetch-*, etc.), cookie/session persistence for `cf_clearance` tracking, and request timing jitter (50–200ms random delays between cycles)
 - **Spoofed IP Headers** — `X-Forwarded-For`, `CF-Connecting-IP`, and `True-Client-IP` randomized per request
 - **State Persistence** — Attack state saved to `attackState.json`, auto-resumes on restart
 - **CLI Interface** — Interactive command-line with colored output
@@ -196,6 +197,7 @@ Both HTTP and SOCKS5 proxies are supported. Without proxies, the tool falls back
 | `RAW_TCP` | `true` | Enable raw TCP flood mode; set to `false` to disable |
 | `KEEP_ALIVE` | `true` | Enable HTTP keep-alive connections; set to `false` to disable |
 | `USE_CLUSTER` | `false` | Enable multi-core cluster forking; set to `true` to enable |
+| `L7_BYPASS` | `false` | Enable L7 bypass techniques (browser TLS fingerprints, Sec-* headers, cookie persistence, request jitter); set to `true` to enable |
 | `PID` | — | Set to `0` to disable auto-restart from `index.js` |
 
 You can set these via command line or a `.env` file:

