@@ -1,5 +1,5 @@
 {
-    "name": "haji-mix-botnet-ddos-server",
+    "name": "nethriondev-ddos-server",
     "version": "1.0.0",
     "description": "A botnet server to perform DDOS attacks using various proxies.",
     "main": "index.js",
