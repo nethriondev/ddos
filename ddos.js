@@ -82,14 +82,13 @@ const browserProfiles = L7_BYPASS ? [
   { name: "firefox-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA" },
 ] : null;
 
-// Pre-create TLS agents per browser profile
+// Pre-create TLS agents per browser profile (ciphers excluded — let Node negotiate)
 const browserAgents = L7_BYPASS ? browserProfiles.map(p => new https.Agent({
   keepAlive: KEEP_ALIVE,
   keepAliveMsecs: 1000,
   maxSockets: Infinity,
   maxFreeSockets: 256,
   rejectUnauthorized: false,
-  ciphers: p.ciphers,
   ecdhCurve: "X25519:P-256:P-384:P-521",
   honorCipherOrder: true,
   minVersion: "TLSv1.2",
