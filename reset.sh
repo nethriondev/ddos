@@ -1,2 +1,2 @@
 #!/bin/bash
-rm -rf attackState.json
+pkill -9 -f "index.js|ddos.js" && rm -rf attackState.json
