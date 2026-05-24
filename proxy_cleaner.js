@@ -1,12 +1,13 @@
-const axios = require("axios");
 const fs = require("fs");
+const net = require("net");
 const path = require("path");
-const { HttpsProxyAgent } = require("https-proxy-agent");
+const { request, ProxyAgent } = require("undici");
 
 const PROXY_FILE = path.join(__dirname, "proxy.txt");
 const TEST_URL = process.env.TEST_URL || "https://httpbin.org/ip";
-const CONCURRENCY = 50;
-const TIMEOUT = 8000;
+const CONCURRENCY = parseInt(process.env.CONCURRENCY, 10) || 400;
+const TCP_TIMEOUT = parseInt(process.env.TCP_TIMEOUT, 10) || 1200;
+const HTTP_TIMEOUT = parseInt(process.env.HTTP_TIMEOUT, 10) || 2500;
 
 const colors = {
   red: (t) => `\x1b[31m${t}\x1b[0m`,
@@ -26,25 +27,39 @@ function loadProxies() {
   }
 }
 
+function tcpConnect(proxy) {
+  return new Promise((resolve) => {
+    const [host, port] = proxy.split(":");
+    const socket = new net.Socket();
+    socket.setTimeout(TCP_TIMEOUT);
+    socket.on("connect", () => { socket.destroy(); resolve(true); });
+    socket.on("error", () => { socket.destroy(); resolve(false); });
+    socket.on("timeout", () => { socket.destroy(); resolve(false); });
+    socket.connect(parseInt(port, 10), host);
+  });
+}
+
 async function testProxy(proxy) {
-  const url = `http://${proxy}`;
+  if (!(await tcpConnect(proxy))) return false;
   try {
-    const agent = new HttpsProxyAgent(url);
-    const res = await axios.get(TEST_URL, {
-      httpsAgent: agent,
-      timeout: TIMEOUT,
-      validateStatus: () => true,
+    const agent = new ProxyAgent(`http://${proxy}`);
+    const res = await request(TEST_URL, {
+      dispatcher: agent,
+      method: "GET",
+      signal: AbortSignal.timeout(HTTP_TIMEOUT),
     });
-    if (res.status === 200 && res.data?.origin) {
-      return true;
-    }
-    return false;
+    if (res.statusCode !== 200) return false;
+    const body = await res.body.json();
+    return !!body?.origin;
   } catch {
     return false;
   }
 }
 
 async function testProxies(proxies) {
+  console.log(colors.cyan(`  Testing against ${TEST_URL} (concurrency: ${CONCURRENCY}, tcp: ${TCP_TIMEOUT}ms, http: ${HTTP_TIMEOUT}ms)\n`));
+
+  const deadProxies = new Set();
   const alive = [];
   let tested = 0;
   const total = proxies.length;
@@ -53,16 +68,26 @@ async function testProxies(proxies) {
   for (let i = 0; i < proxies.length; i += CONCURRENCY) {
     const batch = proxies.slice(i, i + CONCURRENCY);
     const results = await Promise.allSettled(
-      batch.map(async (proxy) => {
-        const isAlive = await testProxy(proxy);
-        return { proxy, isAlive };
-      })
+      batch.map((proxy) =>
+        testProxy(proxy).then((isAlive) => ({ proxy, isAlive }))
+      )
     );
 
+    let batchDead = 0;
     for (const r of results) {
-      if (r.status === "fulfilled" && r.value.isAlive) {
-        alive.push(r.value.proxy);
+      if (r.status === "fulfilled") {
+        if (r.value.isAlive) {
+          alive.push(r.value.proxy);
+        } else {
+          deadProxies.add(r.value.proxy);
+          batchDead++;
+        }
       }
+    }
+
+    if (batchDead > 0) {
+      const remaining = proxies.filter((p) => !deadProxies.has(p));
+      fs.writeFileSync(PROXY_FILE, remaining.join("\n") + "\n");
     }
 
     tested += batch.length;
@@ -74,19 +99,6 @@ async function testProxies(proxies) {
   }
 
   return alive;
-}
-
-function saveProxies(proxies) {
-  // Create backup of old file
-  const backupPath = PROXY_FILE + ".bak";
-  try {
-    if (fs.existsSync(PROXY_FILE)) {
-      fs.copyFileSync(PROXY_FILE, backupPath);
-      console.log(colors.gray(`  Backup saved: ${backupPath}`));
-    }
-  } catch {}
-
-  fs.writeFileSync(PROXY_FILE, proxies.join("\n") + "\n");
 }
 
 async function main() {
@@ -102,7 +114,6 @@ async function main() {
   }
 
   console.log(`\n  Loaded ${colors.cyan(proxies.length)} proxies from proxy.txt`);
-  console.log(colors.cyan(`  Testing against ${TEST_URL} (timeout: ${TIMEOUT}ms, concurrency: ${CONCURRENCY})\n`));
 
   const alive = await testProxies(proxies);
   const removed = proxies.length - alive.length;
@@ -114,12 +125,11 @@ async function main() {
   console.log(`  ${colors.cyan(`Alive rate: ${((alive.length / proxies.length) * 100).toFixed(1)}%`)}`);
 
   if (removed > 0 && alive.length > 0) {
-    saveProxies(alive);
-    console.log(colors.green(`\n  ==> ${removed} dead proxies removed, ${alive.length} alive kept in proxy.txt`));
+    console.log(colors.green(`\n  ==> ${removed} dead proxies removed as they were found. ${alive.length} alive remain.`));
   } else if (alive.length === proxies.length) {
     console.log(colors.green(`\n  ==> All ${alive.length} proxies are alive. Nothing to remove.`));
   } else if (alive.length === 0) {
-    console.log(colors.red(`\n  ==> All ${proxies.length} proxies are dead. proxy.txt left unchanged.`));
+    console.log(colors.red(`\n  ==> All ${proxies.length} proxies are dead.`));
   }
 
   console.log("");
