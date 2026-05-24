@@ -76,23 +76,21 @@ const httpsAgent = KEEP_ALIVE ? new https.Agent({ keepAlive: true, keepAliveMsec
 // ===================== L7 BYPASS ENGINE =====================
 
 const browserProfiles = L7_BYPASS ? [
-  { name: "chrome-win",  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", secCHUA: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', platform: "Windows", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8", acceptLang: "en-US,en;q=0.9", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA" },
-  { name: "chrome-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", secCHUA: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8", acceptLang: "en-US,en;q=0.9", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA" },
-  { name: "firefox-win",  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "Windows", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA" },
-  { name: "firefox-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5", ciphers: "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA" },
+  { name: "chrome-win",  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", secCHUA: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', platform: "Windows", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8", acceptLang: "en-US,en;q=0.9" },
+  { name: "chrome-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36", secCHUA: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8", acceptLang: "en-US,en;q=0.9" },
+  { name: "firefox-win",  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "Windows", accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5" },
+  { name: "firefox-mac",   userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0", secCHUA: '', platform: "macOS",   accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", acceptLang: "en-US,en;q=0.5" },
 ] : null;
 
-// Pre-create TLS agents per browser profile (ciphers excluded — let Node negotiate)
-const browserAgents = L7_BYPASS ? browserProfiles.map(p => new https.Agent({
+// Standard keep-alive agents — custom TLS (ciphers, curves, version pinning)
+// broke TLS handshakes and caused HTTP 403 rejections on many servers.
+// The L7 bypass is driven by headers, cookie persistence, and request jitter.
+const browserAgents = L7_BYPASS ? browserProfiles.map(() => new https.Agent({
   keepAlive: KEEP_ALIVE,
   keepAliveMsecs: 1000,
   maxSockets: Infinity,
   maxFreeSockets: 256,
   rejectUnauthorized: false,
-  ecdhCurve: "X25519:P-256:P-384:P-521",
-  honorCipherOrder: true,
-  minVersion: "TLSv1.2",
-  maxVersion: "TLSv1.3",
 })) : null;
 
 let profileIdxCounter = 0;
