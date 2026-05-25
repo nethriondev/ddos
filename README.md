@@ -1,6 +1,6 @@
 # NETH ORION DDoS v4.0
 
-A multi-threaded HTTP/UDP/TCP stress testing tool with a CLI interface, REST API, proxy rotation, target queuing, cluster support, and automatic public tunnel exposure.
+A multi-threaded HTTP/UDP/TCP stress testing tool with a CLI interface, REST API, proxy rotation, target queuing, and automatic public tunnel exposure.
 
 > **Disclaimer:** This tool is intended for authorized security testing and research only. You must have explicit permission from the target owner before use. Misuse may violate applicable laws.
 
@@ -58,7 +58,6 @@ Then type `help` at the `neth-orion>` prompt to see available commands, or hit t
 
 - **Multi-threaded Attacks** — Configurable thread count (default: 1,000) for concurrent request flooding
 - **All Layers Concurrent** — L4 UDP flood, L4 Raw TCP flood, and L7 HTTP flood all run simultaneously on every thread for maximum impact
-- **Cluster Mode** — Optional multi-core worker forking; enable via `USE_CLUSTER=true`
 - **Keep-Alive Connections** — Persistent HTTP/HTTPS sockets for higher throughput; disable via `KEEP_ALIVE=false`
 - **UDP Flood Mode** — Layer 4 UDP packet saturation against target IPs; disable via `UDP_FLOOD=false`
 - **Raw TCP Flood Mode** — Layer 4 TCP connection bursts with HTTP GET requests; disable via `RAW_TCP=false`
@@ -198,7 +197,6 @@ Both HTTP and SOCKS5 proxies are supported. Without proxies, the tool falls back
 | `UDP_FLOOD` | `true` | Enable UDP flood mode; set to `false` to disable |
 | `RAW_TCP` | `true` | Enable raw TCP flood mode; set to `false` to disable |
 | `KEEP_ALIVE` | `true` | Enable HTTP keep-alive connections; set to `false` to disable |
-| `USE_CLUSTER` | `false` | Enable multi-core cluster forking; set to `true` to enable |
 | `L7_BYPASS` | `true` | Enable L7 bypass techniques (browser TLS fingerprints, Sec-* headers, cookie persistence, request jitter); set to `false` to disable |
 | `PID` | — | Set to `0` to disable auto-restart from `index.js` |
 
@@ -322,7 +320,7 @@ Tunnel sessions are persisted to `nport_sessions.json` and cleaned up on restart
 
 ```
 index.js                 # Spawner — auto-restarts ddos.js on crash (set PID=0 to disable)
-  └── ddos.js            # Main application (cluster-ready via USE_CLUSTER)
+  └── ddos.js            # Main application
         ├── Express API  # REST endpoints: /stresser, /add, /stop, /status
         ├── CLI          # Interactive readline terminal (prompt: neth-orion>)
         ├── Attack Engine # Multi-mode flood engine
@@ -343,8 +341,7 @@ proxy_cleaner.js         # Loads proxy.txt → tests each one → removes dead p
 
 1. `index.js` starts `ddos.js` with `--no-warnings` and monitors it for crashes
 2. `ddos.js` loads saved state from `attackState.json` and resumes any pending attack
-3. If `USE_CLUSTER` is enabled, `ddos.js` forks workers across all CPU cores via the `cluster` module
-4. If a tunnel is configured (`NPORT` env var), `nport.js` requests a token from `api.nport.link` and spawns cloudflared
+3. If a tunnel is configured (`NPORT` env var), `nport.js` requests a token from `api.nport.link` and spawns cloudflared
 5. On `start`, threads are launched — **each thread runs ALL attack layers simultaneously**:
    - **UDP flood** (`dgram` socket sending 1,400-byte payloads to target IP:port — runs continuously in the background)
    - **Raw TCP flood** (`net.Socket` connections writing HTTP GET requests then immediately destroying — runs continuously in the background)
