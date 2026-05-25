@@ -23,6 +23,7 @@ const USE_UDP = process.env.UDP_FLOOD !== "false";
 const USE_RAW_TCP = process.env.RAW_TCP !== "false";
 const KEEP_ALIVE = process.env.KEEP_ALIVE !== "false";
 const L7_BYPASS = process.env.L7_BYPASS !== "false";
+const STOP_KEY = process.env.STOP_KEY || '';
 
 
 
@@ -552,6 +553,9 @@ fs.writeFileSync(stateFilePath, JSON.stringify(state));
 function debouncedSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
+    state.continueAttack = continueAttack;
+    state.currentTarget = currentTarget;
+    state.queue = targetQueue;
     state.totalRequests = totalRequestsSent + totalReqCount;
     state.statusCounts = Object.fromEntries(statusCounts);
     fs.writeFile(stateFilePath, JSON.stringify(state), () => {});
@@ -563,6 +567,9 @@ function saveNow() {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   totalRequestsSent += totalReqCount;
   totalReqCount = 0;
+  state.continueAttack = continueAttack;
+  state.currentTarget = currentTarget;
+  state.queue = targetQueue;
   state.totalRequests = totalRequestsSent;
   state.statusCounts = Object.fromEntries(statusCounts);
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
@@ -696,6 +703,7 @@ const performAttackSingle = async (target, ctx, threadId) => {
           }
           console.log(colors.green(`Spawned ${nextThreadId} threads for: ${nextTarget.url}`));
         } else {
+          console.log(colors.yellow(`[!] Duration expired for ${target.url} — no more targets in queue, stopping attack`));
           continueAttack = false;
           currentTarget = null;
           resetTotal();
@@ -705,12 +713,13 @@ const performAttackSingle = async (target, ctx, threadId) => {
         }
       } catch (err) {
         
+        console.error(colors.red(`[!] DURATION HANDLER ERROR for ${target?.url}: ${err.message} — stopping attack`));
+        console.error(colors.gray(`    Stack: ${err.stack?.split('\n').slice(0, 3).join('\n    ')}`));
         continueAttack = false;
         currentTarget = null;
         targetQueue = [];
         state = { continueAttack: false, currentTarget: null, totalRequests: totalRequestsSent, queue: [] };
         saveNow();
-        console.error(colors.red(`[Duration] Error during expiry handling: ${err.message}`));
       }
       return;
     }
@@ -998,6 +1007,12 @@ app.get("/add", async (req, res) => {
 });
 
 app.get("/stop", async (req, res) => {
+  const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+  if (STOP_KEY && req.query.key !== STOP_KEY) {
+    console.log(colors.red(`[!] STOP attempted from ${ip} — invalid key`));
+    return res.status(403).json({ error: 'Forbidden: ?key= param required (set STOP_KEY in .env)' });
+  }
+  console.log(colors.red(`[!] STOP requested via API from ${ip}`));
   await stopAttack();
   res.json({ success: true, totalRequests: totalRequestsSent });
 });
