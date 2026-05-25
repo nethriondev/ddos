@@ -8,13 +8,28 @@ const restartEnabled = process.env.PID !== "0";
 
 let mainProcess;
 
+try {
+    const { execSync } = require("child_process");
+    try { execSync("echo 0 > /proc/sys/kernel/core_uses_pid", { stdio: "ignore" }); } catch(e) {}
+    try { execSync("echo '/dev/null' > /proc/sys/kernel/core_pattern", { stdio: "ignore" }); } catch(e) {}
+    try { execSync("ulimit -c 0", { stdio: "ignore" }); } catch(e) {}
+    if (process.setrlimit) {
+        process.setrlimit(process.constants.RLIMIT_CORE, { soft: 0, hard: 0 });
+    }
+} catch (error) {}
+
 function start() {
     console.log("Starting main process...");
 
     mainProcess = spawn("node", ["--no-warnings", SCRIPT_PATH], {
         cwd: __dirname,
         stdio: "inherit",
-        shell: true,
+        shell: false,
+        env: {
+            ...process.env,
+            NODE_DISABLE_CORE_DUMP: "1",
+            ELECTRON_DISABLE_STACK_DUMPING: "1"
+        }
     });
 
     mainProcess.on("error", (err) => {
