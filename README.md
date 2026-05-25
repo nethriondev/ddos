@@ -1,6 +1,6 @@
 # NETH ORION DDoS v4.0
 
-A multi-threaded stress testing tool. Just point it at a URL and it floods the target with HTTP, UDP, and TCP traffic all at once. Comes with a CLI, API, proxy support, and auto-resume if it crashes.
+A multi-threaded stress testing tool. Just point it at a URL and it floods the target with HTTP, UDP, TCP, WebSocket, and Socket.IO traffic all at once. Comes with a CLI, API, proxy support, and auto-resume if it crashes.
 
 > **Only use this on targets you own or have written permission to test.**
 
