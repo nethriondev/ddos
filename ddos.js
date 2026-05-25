@@ -666,6 +666,7 @@ const performAttackSingle = async (target, ctx, threadId) => {
     
     if (Date.now() - target.startTime >= target.duration) {
       
+      if (target !== currentTarget) return;
       if (durationExpiryHandled) return;
       durationExpiryHandled = true;
       try {
