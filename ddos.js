@@ -706,6 +706,9 @@ const performAttackSingle = async (target, ctx, threadId) => {
         
         continueAttack = false;
         currentTarget = null;
+        targetQueue = [];
+        state = { continueAttack: false, currentTarget: null, totalRequests: totalRequestsSent, queue: [] };
+        saveNow();
         console.error(colors.red(`[Duration] Error during expiry handling: ${err.message}`));
       }
       return;
