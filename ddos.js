@@ -462,7 +462,7 @@ function formatStatusLine() {
   const parts = [];
   const disruptionCodes = [400, 401, 403, 404, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 529, 530];
   const sorted = [...statusCounts.entries()]
-    .filter(([code]) => code === "error" || disruptionCodes.includes(parseInt(code)))
+    .filter(([code]) => code === "error" || code === "200" || disruptionCodes.includes(parseInt(code)))
     .sort((a, b) => b[1] - a[1]);
   for (const [code, count] of sorted.slice(0, 5)) {
     if (count === 0) continue;
